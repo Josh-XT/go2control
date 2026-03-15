@@ -1,4 +1,6 @@
-# Unitree Go2 Pro Control API
+# go2control
+
+> **⚠️ Experimental** — This project is under active development and may contain bugs or incomplete features. Use at your own risk.
 
 REST + WebSocket API for controlling the Unitree Go2 Pro robot dog, with AGiXT AI agent integration.
 
@@ -135,3 +137,14 @@ Configure the agent with `GO2_API_URL=http://<go2control-host>:8000`.
 - **Audio**: Built-in speaker + microphone
 - **Connectivity**: WiFi 6, Bluetooth 5.2, 4G (with GPS)
 - **Battery**: ~2 hours runtime
+
+## Contributing
+
+This project is experimental and we welcome contributions! If you find a bug or have a suggestion:
+
+- **Report issues** on the [GitHub Issues](https://github.com/Josh-XT/go2control/issues) page
+- **Pull requests** are always welcome — if you find an issue you can fix, we'd love the help
+
+## License
+
+MIT — Use at your own risk. This is unofficial/experimental code.
