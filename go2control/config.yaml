@@ -1,0 +1,34 @@
+# Go2 Control — Configuration
+# Override any setting with GO2_<KEY> environment variables
+
+simulation: true  # Set false when connected to real robot
+
+host: "0.0.0.0"
+port: 8000
+
+connection:
+  method: "webrtc"           # webrtc or dds
+  robot_ip: "192.168.12.1"   # AP mode default; use robot's IP for LocalSTA
+  connection_mode: "LocalAP" # LocalAP, LocalSTA, or Remote
+  serial_number: ""          # Required for Remote connections
+  dds_domain_id: 0           # DDS domain (only for dds method)
+  dds_interface: "eth0"      # Network interface (only for dds method)
+
+safety:
+  max_vx: 1.5        # Max forward speed m/s
+  max_vy: 0.8        # Max lateral speed m/s
+  max_vyaw: 2.0      # Max yaw rate rad/s
+  api_command_timeout: 5.0  # Default command duration seconds
+  watchdog_timeout: 2.0     # Kill motion if no new command in N seconds
+  ramp_rate: 3.0            # Max acceleration m/s²
+
+audio:
+  default_volume: 5   # 0-10
+  enable_mic: true
+  sample_rate: 48000
+  channels: 2
+
+video:
+  enable: true
+  jpeg_quality: 80
+  max_fps: 10

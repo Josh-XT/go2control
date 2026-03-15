@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Go2 Pro Control Dashboard</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0a0a0a; color: #e0e0e0; min-height: 100vh; }
+.header { background: #111; padding: 12px 20px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #333; }
+.header h1 { font-size: 18px; color: #4fc3f7; }
+.status-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; margin-right: 8px; }
+.status-dot.connected { background: #4caf50; }
+.status-dot.disconnected { background: #f44336; }
+.main { display: grid; grid-template-columns: 1fr 300px; gap: 16px; padding: 16px; max-width: 1400px; margin: 0 auto; }
+.panel { background: #1a1a1a; border: 1px solid #333; border-radius: 8px; padding: 16px; }
+.panel h2 { font-size: 14px; color: #888; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 12px; }
+.camera-view { width: 100%; aspect-ratio: 16/9; background: #111; border-radius: 4px; display: flex; align-items: center; justify-content: center; overflow: hidden; margin-bottom: 12px; }
+.camera-view img { max-width: 100%; max-height: 100%; }
+.camera-view .placeholder { color: #555; }
+.btn-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 12px; }
+.btn-grid-wide { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 12px; }
+.btn { padding: 10px 4px; border: 1px solid #444; border-radius: 6px; background: #222; color: #ddd; cursor: pointer; font-size: 11px; text-align: center; transition: all 0.15s; }
+.btn:hover { background: #333; border-color: #666; }
+.btn:active { background: #444; transform: scale(0.97); }
+.btn.state { border-color: #2196f3; color: #64b5f6; }
+.btn.trick { border-color: #ff9800; color: #ffb74d; }
+.btn.flip { border-color: #e91e63; color: #f06292; }
+.btn.gait { border-color: #4caf50; color: #81c784; }
+.btn.danger { border-color: #f44336; color: #fff; background: #b71c1c; }
+.btn.danger:hover { background: #d32f2f; }
+.joystick-area { display: flex; gap: 16px; justify-content: center; margin: 12px 0; }
+.stick { width: 120px; height: 120px; background: #111; border-radius: 50%; border: 2px solid #333; position: relative; touch-action: none; }
+.stick-knob { width: 40px; height: 40px; background: #4fc3f7; border-radius: 50%; position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); cursor: grab; transition: background 0.1s; }
+.stick-knob:active { background: #29b6f6; cursor: grabbing; }
+.stick-label { text-align: center; font-size: 11px; color: #666; margin-top: 4px; }
+.stat { display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid #222; font-size: 13px; }
+.stat-label { color: #888; }
+.stat-value { color: #e0e0e0; font-family: monospace; }
+.volume-control { display: flex; align-items: center; gap: 8px; margin: 8px 0; }
+.volume-control input[type="range"] { flex: 1; }
+.volume-control span { font-size: 12px; color: #888; min-width: 30px; }
+.keyboard-help { font-size: 11px; color: #555; margin-top: 12px; line-height: 1.6; }
+.keyboard-help kbd { background: #333; padding: 1px 5px; border-radius: 3px; border: 1px solid #555; font-family: monospace; }
+</style>
+</head>
+<body>
+<div class="header">
+    <h1>🐕 Go2 Pro Control</h1>
+    <div>
+        <span class="status-dot" id="statusDot"></span>
+        <span id="statusText">Connecting...</span>
+    </div>
+</div>
+<div class="main">
+    <div>
+        <!-- Camera -->
+        <div class="panel">
+            <h2>Camera</h2>
+            <div class="camera-view" id="cameraView">
+                <span class="placeholder">No camera feed</span>
+            </div>
+            <div style="display:flex; gap:8px;">
+                <button class="btn" onclick="captureImage()" style="flex:1;">📸 Snapshot</button>
+                <button class="btn" onclick="toggleAutoCapture()" id="autoCaptureBtn" style="flex:1;">▶ Auto Capture</button>
+            </div>
+        </div>
+
+        <!-- Movement -->
+        <div class="panel" style="margin-top:16px;">
+            <h2>Movement</h2>
+            <div class="joystick-area">
+                <div>
+                    <div class="stick" id="leftStick">
+                        <div class="stick-knob" id="leftKnob"></div>
+                    </div>
+                    <div class="stick-label">Move (vx/vy)</div>
+                </div>
+                <div>
+                    <div class="stick" id="rightStick">
+                        <div class="stick-knob" id="rightKnob"></div>
+                    </div>
+                    <div class="stick-label">Turn (vyaw)</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- State Actions -->
+        <div class="panel" style="margin-top:16px;">
+            <h2>State Transitions</h2>
+            <div class="btn-grid">
+                <button class="btn state" onclick="doAction('balance_stand')">Balance Stand</button>
+                <button class="btn state" onclick="doAction('stand_up')">Stand Up</button>
+                <button class="btn state" onclick="doAction('stand_down')">Lie Down</button>
+                <button class="btn state" onclick="doAction('recovery_stand')">Recovery</button>
+                <button class="btn state" onclick="doAction('sit')">Sit</button>
+                <button class="btn state" onclick="doAction('rise_sit')">Rise Sit</button>
+                <button class="btn state" onclick="doAction('stop_move')">Stop Move</button>
+                <button class="btn danger" onclick="doAction('damp')">DAMP (E-Stop)</button>
+            </div>
+        </div>
+
+        <!-- Tricks -->
+        <div class="panel" style="margin-top:16px;">
+            <h2>Tricks & Animations</h2>
+            <div class="btn-grid">
+                <button class="btn trick" onclick="doAction('hello')">👋 Hello</button>
+                <button class="btn trick" onclick="doAction('stretch')">🙆 Stretch</button>
+                <button class="btn trick" onclick="doAction('content')">😊 Content</button>
+                <button class="btn trick" onclick="doAction('dance1')">💃 Dance 1</button>
+                <button class="btn trick" onclick="doAction('dance2')">🕺 Dance 2</button>
+                <button class="btn trick" onclick="doAction('pose')">🧍 Pose</button>
+                <button class="btn trick" onclick="doAction('scrape')">🧧 Scrape</button>
+                <button class="btn trick" onclick="doAction('heart')">❤️ Heart</button>
+            </div>
+            <h2 style="margin-top:12px;">Flips & Jumps</h2>
+            <div class="btn-grid">
+                <button class="btn flip" onclick="doAction('front_flip')">Front Flip</button>
+                <button class="btn flip" onclick="doAction('left_flip')">Left Flip</button>
+                <button class="btn flip" onclick="doAction('back_flip')">Back Flip</button>
+                <button class="btn flip" onclick="doAction('front_jump')">Front Jump</button>
+                <button class="btn flip" onclick="doAction('front_pounce')">Pounce</button>
+                <button class="btn flip" onclick="doAction('hand_stand')">Handstand</button>
+            </div>
+            <h2 style="margin-top:12px;">Gaits</h2>
+            <div class="btn-grid-wide">
+                <button class="btn gait" onclick="doAction('static_walk')">Static Walk</button>
+                <button class="btn gait" onclick="doAction('trot_run')">Trot Run</button>
+                <button class="btn gait" onclick="doAction('economic_gait')">Eco Gait</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Right sidebar -->
+    <div>
+        <div class="panel">
+            <h2>Status</h2>
+            <div class="stat"><span class="stat-label">Mode</span><span class="stat-value" id="sMode">—</span></div>
+            <div class="stat"><span class="stat-label">Battery</span><span class="stat-value" id="sBattery">—</span></div>
+            <div class="stat"><span class="stat-label">Speed Level</span><span class="stat-value" id="sSpeed">—</span></div>
+            <div class="stat"><span class="stat-label">Velocity</span><span class="stat-value" id="sVel">—</span></div>
+            <div class="stat"><span class="stat-label">Connected</span><span class="stat-value" id="sConn">—</span></div>
+            <div class="stat"><span class="stat-label">Uptime</span><span class="stat-value" id="sUptime">—</span></div>
+            <div class="stat"><span class="stat-label">Sequence</span><span class="stat-value" id="sSeq">—</span></div>
+        </div>
+
+        <div class="panel" style="margin-top:16px;">
+            <h2>Volume</h2>
+            <div class="volume-control">
+                <span>🔇</span>
+                <input type="range" min="0" max="10" value="5" id="volumeSlider" onchange="setVolume(this.value)">
+                <span id="volumeVal">5</span>
+                <span>🔊</span>
+            </div>
+        </div>
+
+        <div class="panel" style="margin-top:16px;">
+            <h2>Speed Level</h2>
+            <div class="btn-grid-wide">
+                <button class="btn" onclick="setSpeedLevel(-1)">🐌 Slow</button>
+                <button class="btn" onclick="setSpeedLevel(0)">🚶 Normal</button>
+                <button class="btn" onclick="setSpeedLevel(1)">🏃 Fast</button>
+            </div>
+        </div>
+
+        <div class="panel" style="margin-top:16px;">
+            <h2>Sequences</h2>
+            <div id="sequenceList" style="display:grid;gap:6px;"></div>
+        </div>
+
+        <div class="panel" style="margin-top:16px;">
+            <h2>Keyboard</h2>
+            <div class="keyboard-help">
+                <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> Move<br>
+                <kbd>Q</kbd><kbd>E</kbd> Turn<br>
+                <kbd>Space</kbd> Stop<br>
+                <kbd>Esc</kbd> Emergency Stop<br>
+                <kbd>1</kbd>-<kbd>8</kbd> State actions<br>
+                <kbd>F1</kbd>-<kbd>F8</kbd> Tricks
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+const API = '';
+let ws = null;
+let autoCapture = false;
+let autoCaptureTimer = null;
+
+// WebSocket
+function connectWS() {
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    ws = new WebSocket(`${proto}://${location.host}/ws/telemetry`);
+    ws.onopen = () => { document.getElementById('statusDot').className = 'status-dot connected'; document.getElementById('statusText').textContent = 'Connected'; };
+    ws.onclose = () => { document.getElementById('statusDot').className = 'status-dot disconnected'; document.getElementById('statusText').textContent = 'Disconnected'; setTimeout(connectWS, 2000); };
+    ws.onmessage = (e) => {
+        const d = JSON.parse(e.data);
+        document.getElementById('sMode').textContent = d.mode;
+        document.getElementById('sBattery').textContent = d.battery_percent + '%';
+        document.getElementById('sSpeed').textContent = d.speed_level;
+        const v = d.current_velocity;
+        document.getElementById('sVel').textContent = `${v.vx}/${v.vy}/${v.vyaw}`;
+        document.getElementById('sConn').textContent = d.connected ? 'Yes' : 'No';
+        document.getElementById('sUptime').textContent = Math.round(d.uptime_seconds) + 's';
+        document.getElementById('sSeq').textContent = d.active_sequence || 'None';
+    };
+}
+connectWS();
+
+// API calls
+async function doAction(name) {
+    await fetch(`${API}/api/v1/action/${name}`, {method: 'POST'});
+}
+async function sendMove(vx, vy, vyaw) {
+    await fetch(`${API}/api/v1/move`, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({vx, vy, vyaw, duration: 0.5})});
+}
+async function stopMove() {
+    await fetch(`${API}/api/v1/stop`, {method:'POST'});
+}
+async function emergencyStop() {
+    await fetch(`${API}/api/v1/emergency_stop`, {method:'POST'});
+}
+async function setVolume(v) {
+    document.getElementById('volumeVal').textContent = v;
+    await fetch(`${API}/api/v1/audio/volume`, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({level: parseInt(v)})});
+}
+async function setSpeedLevel(l) {
+    await fetch(`${API}/api/v1/speed_level`, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({level: l})});
+}
+async function captureImage() {
+    try {
+        const resp = await fetch(`${API}/api/v1/camera/snapshot`);
+        if (resp.ok) {
+            const blob = await resp.blob();
+            const url = URL.createObjectURL(blob);
+            document.getElementById('cameraView').innerHTML = `<img src="${url}">`;
+        }
+    } catch(e) { console.error(e); }
+}
+function toggleAutoCapture() {
+    autoCapture = !autoCapture;
+    document.getElementById('autoCaptureBtn').textContent = autoCapture ? '⏸ Auto Capture' : '▶ Auto Capture';
+    if (autoCapture) { autoCaptureTimer = setInterval(captureImage, 1000); }
+    else { clearInterval(autoCaptureTimer); }
+}
+
+// Load sequences
+async function loadSequences() {
+    try {
+        const resp = await fetch(`${API}/api/v1/sequences`);
+        const data = await resp.json();
+        const el = document.getElementById('sequenceList');
+        el.innerHTML = Object.entries(data.sequences).map(([name, info]) =>
+            `<button class="btn" onclick="runSequence('${name}')">${name} (${info.steps} steps${info.loop?' ↻':''})</button>`
+        ).join('');
+    } catch(e) {}
+}
+async function runSequence(name) {
+    await fetch(`${API}/api/v1/sequences/${name}/run`, {method:'POST'});
+}
+loadSequences();
+
+// Virtual joysticks
+function setupStick(stickId, knobId, onMove) {
+    const stick = document.getElementById(stickId);
+    const knob = document.getElementById(knobId);
+    let dragging = false;
+    const r = 40; // max pixel offset
+
+    function update(e) {
+        const rect = stick.getBoundingClientRect();
+        const cx = rect.left + rect.width/2;
+        const cy = rect.top + rect.height/2;
+        const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+        const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+        let dx = clientX - cx;
+        let dy = clientY - cy;
+        const dist = Math.sqrt(dx*dx + dy*dy);
+        if (dist > r) { dx = dx/dist*r; dy = dy/dist*r; }
+        knob.style.transform = `translate(calc(-50% + ${dx}px), calc(-50% + ${dy}px))`;
+        onMove(dx/r, -dy/r); // normalized -1 to 1
+    }
+    function release() {
+        dragging = false;
+        knob.style.transform = 'translate(-50%, -50%)';
+        onMove(0, 0);
+    }
+
+    stick.addEventListener('mousedown', (e) => { dragging = true; update(e); });
+    stick.addEventListener('touchstart', (e) => { dragging = true; update(e); e.preventDefault(); });
+    document.addEventListener('mousemove', (e) => { if(dragging) update(e); });
+    document.addEventListener('touchmove', (e) => { if(dragging) update(e); });
+    document.addEventListener('mouseup', release);
+    document.addEventListener('touchend', release);
+}
+
+let moveVx=0, moveVy=0, moveVyaw=0;
+let moveTimer = null;
+function startMoveLoop() {
+    if (moveTimer) return;
+    moveTimer = setInterval(() => {
+        if (Math.abs(moveVx) > 0.05 || Math.abs(moveVy) > 0.05 || Math.abs(moveVyaw) > 0.05) {
+            sendMove(moveVx * 1.5, moveVy * 0.8, moveVyaw * 2.0);
+        }
+    }, 200);
+}
+startMoveLoop();
+
+setupStick('leftStick', 'leftKnob', (x, y) => { moveVx = y; moveVy = -x; });
+setupStick('rightStick', 'rightKnob', (x, y) => { moveVyaw = -x; });
+
+// Keyboard
+const stateActions = ['balance_stand','stand_up','stand_down','recovery_stand','sit','rise_sit','stop_move','damp'];
+const trickActions = ['hello','stretch','content','dance1','dance2','pose','scrape','heart'];
+const keys = {};
+document.addEventListener('keydown', (e) => {
+    if (keys[e.key]) return;
+    keys[e.key] = true;
+    if (e.key === ' ') { e.preventDefault(); stopMove(); }
+    else if (e.key === 'Escape') emergencyStop();
+    else if (e.key >= '1' && e.key <= '8') { const i = parseInt(e.key)-1; if(stateActions[i]) doAction(stateActions[i]); }
+    else if (e.key.startsWith('F') && e.key.length <= 3) {
+        const n = parseInt(e.key.slice(1));
+        if (n >= 1 && n <= 8) { e.preventDefault(); doAction(trickActions[n-1]); }
+    }
+    updateKeyMove();
+});
+document.addEventListener('keyup', (e) => { delete keys[e.key]; updateKeyMove(); });
+function updateKeyMove() {
+    let vx=0, vy=0, vyaw=0;
+    if (keys['w'] || keys['W']) vx += 0.5;
+    if (keys['s'] || keys['S']) vx -= 0.5;
+    if (keys['a'] || keys['A']) vy += 0.4;
+    if (keys['d'] || keys['D']) vy -= 0.4;
+    if (keys['q'] || keys['Q']) vyaw += 1.0;
+    if (keys['e'] || keys['E']) vyaw -= 1.0;
+    if (vx || vy || vyaw) sendMove(vx, vy, vyaw);
+}
+</script>
+</body>
+</html>

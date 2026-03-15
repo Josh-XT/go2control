@@ -1,0 +1,15 @@
+[Unit]
+Description=Unitree Go2 Pro Robot Control API
+After=network.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/go2control/go2control
+ExecStart=/usr/bin/python3 api_server.py
+Restart=always
+RestartSec=5
+Environment=GO2_SIMULATION=false
+
+[Install]
+WantedBy=multi-user.target

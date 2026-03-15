@@ -1,0 +1,8 @@
+httpx
+pyserial
+pyyaml
+uvicorn[standard]
+fastapi
+websockets
+numpy
+opencv-python-headless
