@@ -6,7 +6,7 @@ REST + WebSocket API for controlling the Unitree Go2 Pro robot dog, with AGiXT A
 
 ## Features
 
-- **30+ Sport Actions**: Walk, run, sit, tricks, dances, flips, poses
+- **28 Sport Actions**: Walk, run, sit, tricks, dances, flips, poses
 - **Velocity Control**: Forward/backward, lateral, rotation with safety ramping
 - **Camera**: HD front camera snapshot capture
 - **Speaker**: Volume control, audio playback
@@ -63,7 +63,12 @@ Requires Ethernet connection to robot's internal computer at `192.168.123.161`.
 | POST | `/api/v1/speed_level` | Set speed (-1/0/1) |
 | POST | `/api/v1/emergency_stop` | DAMP all motors |
 
-### Actions (30+)
+### Status
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/v1/status` | Robot mode, velocity, battery, connections |
+
+### Actions (28)
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/api/v1/actions` | List all sport actions |
@@ -86,7 +91,10 @@ Requires Ethernet connection to robot's internal computer at `192.168.123.161`.
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/api/v1/sequences` | List all sequences |
-| POST | `/api/v1/sequences/{name}/run` | Run a sequence |
+| GET | `/api/v1/sequences/{name}` | Get sequence definition |
+| POST | `/api/v1/sequences/{name}` | Save a custom sequence |
+| DELETE | `/api/v1/sequences/{name}` | Delete a user-saved sequence |
+| POST | `/api/v1/sequences/{name}/run` | Run a named sequence |
 | POST | `/api/v1/sequences/stop` | Stop active sequence |
 
 ### Agent (AGiXT)
@@ -104,13 +112,14 @@ Requires Ethernet connection to robot's internal computer at `192.168.123.161`.
 
 ## AGiXT Extension
 
-Copy `unitree_go2.py` from the AGiXT extensions to your AGiXT instance:
+The AGiXT extension for this robot is in the [unitree_extensions](https://github.com/Josh-XT/unitree_extensions) repo. Install it with:
 
 ```bash
-cp /path/to/AGiXT/agixt/extensions/unitree_go2.py /your/agixt/extensions/
+agixt env EXTENSIONS_HUB=https://github.com/Josh-XT/unitree_extensions
+agixt restart
 ```
 
-Configure the agent with `GO2_API_URL=http://<go2control-host>:8000`.
+Then configure your agent with `GO2_API_URL=http://<go2control-host>:8000`.
 
 ## Sport Actions
 
@@ -129,6 +138,20 @@ Configure the agent with `GO2_API_URL=http://<go2control-host>:8000`.
 ### Modes
 `free_walk`, `cross_step`, `switch_joystick`
 
+## Project Structure
+
+```text
+go2control/
+├── api_server.py        # FastAPI server
+├── config.py            # YAML + env var config loader
+├── config.yaml          # Default configuration
+├── sequence_library.py  # Built-in + user sequence management
+├── dashboard.html       # Web control panel
+├── go2control.service   # systemd unit file
+├── sequences/           # User-saved sequences (JSON)
+└── requirements.txt     # Python dependencies
+```
+
 ## Hardware
 
 - **Model**: Unitree Go2 Pro
@@ -137,6 +160,12 @@ Configure the agent with `GO2_API_URL=http://<go2control-host>:8000`.
 - **Audio**: Built-in speaker + microphone
 - **Connectivity**: WiFi 6, Bluetooth 5.2, 4G (with GPS)
 - **Battery**: ~2 hours runtime
+
+## Related Repositories
+
+- **[g1control](https://github.com/Josh-XT/g1control)** — Control server for the Unitree G1 Basic humanoid
+- **[unitree_extensions](https://github.com/Josh-XT/unitree_extensions)** — AGiXT extensions for both robots
+- **[AGiXT](https://github.com/Josh-XT/AGiXT)** — AI agent framework
 
 ## Contributing
 
