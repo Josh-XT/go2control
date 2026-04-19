@@ -850,6 +850,9 @@ class AGiXTVoiceClient:
         self._wake_word_until = 0.0  # time.time() when wake listening expires
         self._wake_word_http: Optional[httpx.AsyncClient] = None
 
+        # WebSocket send lock to prevent message interleaving
+        self._ws_send_lock = asyncio.Lock()
+
         # Idle behavior state
         self._last_idle_look = 0.0
         self._last_idle_animation = 0.0
@@ -1348,15 +1351,23 @@ class AGiXTVoiceClient:
                         else f"max duration ({max_speech}s)"
                     )
                     log.info(f"[Audio] {reason} — sending")
-                    await self._send_speech_audio(
-                        bytes(speech_buffer), sample_rate
-                    )
+                    # Respect wake word gate on force-send too
+                    if ww_enabled and not self._wake_word_active:
+                        log.debug("[Audio] Force-send suppressed — no wake word")
+                    else:
+                        await self._send_speech_audio(
+                            bytes(speech_buffer), sample_rate
+                        )
                     speech_buffer.clear()
                     is_speaking = False
                     silence_start = 0.0
 
-                # Check if wake word listen window has expired
-                if self._wake_word_active and time.time() > self._wake_word_until:
+                # Check if wake word listen window has expired (not mid-speech)
+                if (
+                    self._wake_word_active
+                    and not is_speaking
+                    and time.time() > self._wake_word_until
+                ):
                     self._wake_word_active = False
                     log.info("[Audio] Wake word listen window expired")
 
@@ -1378,22 +1389,25 @@ class AGiXTVoiceClient:
             wf.writeframes(pcm_data)
         wav_data = wav_buffer.getvalue()
 
-        # Send WAV as binary frame, then signal end
-        await self._ws.send(wav_data)
-        await self._ws.send(json.dumps({"type": "audio.input.end"}))
+        # Send WAV as binary frame, then signal end (locked to prevent interleaving)
+        async with self._ws_send_lock:
+            await self._ws.send(wav_data)
+            await self._ws.send(json.dumps({"type": "audio.input.end"}))
         log.info(f"[Audio] Sent {len(wav_data)} bytes WAV to AGiXT")
 
     async def send_text(self, text: str):
         """Send a text message to AGiXT (for testing without audio)."""
         if self._ws and self._running:
-            await self._ws.send(json.dumps({"type": "text.input", "text": text}))
+            async with self._ws_send_lock:
+                await self._ws.send(json.dumps({"type": "text.input", "text": text}))
             log.info(f"[Send] Text: {text}")
 
     async def send_audio(self, wav_data: bytes):
         """Send audio data to AGiXT."""
         if self._ws and self._running:
-            await self._ws.send(wav_data)
-            await self._ws.send(json.dumps({"type": "audio.input.end"}))
+            async with self._ws_send_lock:
+                await self._ws.send(wav_data)
+                await self._ws.send(json.dumps({"type": "audio.input.end"}))
             log.info(f"[Send] Audio: {len(wav_data)} bytes")
 
     # ─── Wake Word Detection ─────────────────────────────────────────────
@@ -1421,7 +1435,7 @@ class AGiXTVoiceClient:
         audio_b64 = base64.b64encode(wav_buffer.getvalue()).decode()
 
         # URL-safe word encoding
-        word_slug = word.replace(" ", "%20")
+        word_slug = __import__("urllib.parse", fromlist=["quote"]).quote(word, safe="")
         url = f"{server.rstrip('/')}/v1/wakeword/predict/{word_slug}"
 
         try:
