@@ -1,179 +1,103 @@
-# go2control
+# Go2 Control — AGiXT Voice Client for Unitree Go2 Pro
 
-> **⚠️ Experimental** — This project is under active development and may contain bugs or incomplete features. Use at your own risk.
+Voice-controlled robot dog using AGiXT's real-time voice conversation pipeline. Runs on a Raspberry Pi 5 connected to the Go2 via Ethernet (DDS SDK). The Pi bridges the robot's camera and microphone to AGiXT, which sees what the robot sees, hears what it hears, and controls it through voice commands.
 
-REST + WebSocket API for controlling the Unitree Go2 Pro robot dog, with AGiXT AI agent integration.
+## Architecture
 
-## Features
+```
+┌──────────────┐    DDS/Ethernet    ┌──────────────┐    WebSocket    ┌──────────────┐
+│  Unitree Go2 │◄──────────────────►│  Raspberry   │◄──────────────►│   AGiXT      │
+│  Pro Robot   │  SDK commands,     │  Pi 5        │  Audio, images │   Server     │
+│              │  camera, audio     │  (go2_client)│  tool calls    │  (35B + 0.8B)│
+└──────────────┘                    └──────────────┘                └──────────────┘
+```
 
-- **28 Sport Actions**: Walk, run, sit, tricks, dances, flips, poses
-- **Velocity Control**: Forward/backward, lateral, rotation with safety ramping
-- **Camera**: HD front camera snapshot capture
-- **Speaker**: Volume control, audio playback
-- **Microphone**: Audio capture for transcription
-- **Body Orientation**: Roll, pitch, yaw control
-- **Sequences**: Pre-built and custom movement routines
-- **WebSocket**: Real-time telemetry streaming
-- **Dashboard**: Web-based control panel with virtual joysticks
-- **AGiXT Integration**: Full AI agent context and command endpoints
+**Data flows:**
+- **Camera → AGiXT:** Periodic JPEG frames from Go2 camera sent as vision context
+- **Microphone → AGiXT:** Audio from Go2 mic (or Pi USB mic) sent for STT
+- **AGiXT → Robot:** Tool calls for movement, actions, body orientation
+- **AGiXT → Speaker:** TTS audio streamed back for robot to speak
 
 ## Quick Start
 
+### 1. Install on Pi 5
+
 ```bash
-# Install dependencies
 pip install -r requirements.txt
-
-# For WebRTC connection (recommended, no jailbreak needed):
-pip install unitree_webrtc_connect
-
-# For DDS connection (wired Ethernet):
-# Requires cyclonedds==0.10.2 and unitree_sdk2py
-
-# Edit config
-cd go2control
-cp config.yaml config.yaml.bak
-nano config.yaml  # Set simulation: false, robot_ip, connection_mode
-
-# Run
-python3 api_server.py
 ```
 
-## Connection Methods
+### 2. Configure
 
-### WebRTC (Recommended)
-Works wirelessly with all Go2 models (AIR/PRO/EDU). No jailbreak needed.
-
-| Mode | Use Case | Config |
-|------|----------|--------|
-| `LocalAP` | Connected to robot's WiFi AP | `robot_ip: 192.168.12.1` |
-| `LocalSTA` | Same WiFi network as robot | `robot_ip: <robot's IP>` |
-| `Remote` | Via Unitree TURN server (requires 4G) | `serial_number: <SN>` |
-
-### DDS (Wired)
-Requires Ethernet connection to robot's internal computer at `192.168.123.161`.
-
-## API Endpoints
-
-### Movement
-| Method | Path | Description |
-|--------|------|-------------|
-| POST | `/api/v1/move` | Velocity control (vx, vy, vyaw, duration) |
-| POST | `/api/v1/stop` | Stop all movement |
-| POST | `/api/v1/euler` | Set body orientation |
-| POST | `/api/v1/speed_level` | Set speed (-1/0/1) |
-| POST | `/api/v1/emergency_stop` | DAMP all motors |
-
-### Status
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/api/v1/status` | Robot mode, velocity, battery, connections |
-
-### Actions (28)
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/api/v1/actions` | List all sport actions |
-| POST | `/api/v1/action/{name}` | Execute a sport action |
-
-### Camera
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/api/v1/camera/snapshot` | JPEG image |
-| GET | `/api/v1/camera/snapshot/base64` | Base64 JPEG |
-
-### Audio
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/api/v1/audio/volume` | Get volume |
-| POST | `/api/v1/audio/volume` | Set volume (0-10) |
-| GET | `/api/v1/audio/mic?seconds=5` | Capture mic audio |
-
-### Sequences
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/api/v1/sequences` | List all sequences |
-| GET | `/api/v1/sequences/{name}` | Get sequence definition |
-| POST | `/api/v1/sequences/{name}` | Save a custom sequence |
-| DELETE | `/api/v1/sequences/{name}` | Delete a user-saved sequence |
-| POST | `/api/v1/sequences/{name}/run` | Run a named sequence |
-| POST | `/api/v1/sequences/stop` | Stop active sequence |
-
-### Agent (AGiXT)
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/api/v1/agent/context` | Full robot context for AI |
-| POST | `/api/v1/agent/command` | Unified agent command endpoint |
-
-### System
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/health` | Health check |
-| GET | `/dashboard` | Web control panel |
-| WS | `/ws/telemetry` | Real-time WebSocket |
-
-## AGiXT Extension
-
-The AGiXT extension for this robot is in the [unitree_extensions](https://github.com/Josh-XT/unitree_extensions) repo. Install it with:
+Edit `go2control/config.yaml` or set environment variables:
 
 ```bash
-agixt env EXTENSIONS_HUB=https://github.com/Josh-XT/unitree_extensions
-agixt restart
+export AGIXT_SERVER="ws://your-agixt-server:7437"
+export AGIXT_JWT="your-jwt-token"
+export GO2_IP="192.168.123.161"
+export GO2_CONNECTION="dds"
 ```
 
-Then configure your agent with `GO2_API_URL=http://<go2control-host>:8000`.
+### 3. Run
 
-## Sport Actions
+```bash
+# With real robot (Ethernet connected)
+python go2control/go2_client.py
 
-### State Transitions
-`damp`, `balance_stand`, `stop_move`, `stand_up`, `stand_down`, `recovery_stand`, `sit`, `rise_sit`
+# Simulation mode (no robot needed)
+python go2control/go2_client.py --simulation
 
-### Tricks & Animations
-`hello`, `stretch`, `content`, `dance1`, `dance2`, `pose`, `scrape`, `heart`
-
-### Flips & Jumps
-`front_flip`, `left_flip`, `back_flip`, `front_jump`, `front_pounce`, `hand_stand`
-
-### Gaits
-`static_walk`, `trot_run`, `economic_gait`
-
-### Modes
-`free_walk`, `cross_step`, `switch_joystick`
-
-## Project Structure
-
-```text
-go2control/
-├── api_server.py        # FastAPI server
-├── config.py            # YAML + env var config loader
-├── config.yaml          # Default configuration
-├── sequence_library.py  # Built-in + user sequence management
-├── dashboard.html       # Web control panel
-├── go2control.service   # systemd unit file
-├── sequences/           # User-saved sequences (JSON)
-└── requirements.txt     # Python dependencies
+# Custom config file
+python go2control/go2_client.py --config my_config.yaml
 ```
 
-## Hardware
+### 4. Test with text input
 
-- **Model**: Unitree Go2 Pro
-- **CPU**: 8-core high-performance processor
-- **Camera**: HD wide-angle front camera
-- **Audio**: Built-in speaker + microphone
-- **Connectivity**: WiFi 6, Bluetooth 5.2, 4G (with GPS)
-- **Battery**: ~2 hours runtime
+When running interactively, type messages to send to AGiXT:
+```
+> Walk forward slowly
+> Turn left and look around
+> Do a hello trick
+> What do you see in front of you?
+> Walk to that ball
+```
 
-## Related Repositories
+## Available Robot Commands
 
-- **[g1control](https://github.com/Josh-XT/g1control)** — Control server for the Unitree G1 Basic humanoid
-- **[unitree_extensions](https://github.com/Josh-XT/unitree_extensions)** — AGiXT extensions for both robots
-- **[AGiXT](https://github.com/Josh-XT/AGiXT)** — AI agent framework
+AGiXT can call these via the voice conversation tool bridge:
 
-## Contributing
+| Tool | Description |
+|------|-------------|
+| `robot_move` | Velocity control (vx, vy, vyaw, duration) |
+| `robot_action` | Sport actions (sit, stand, hello, dance, flip, etc.) |
+| `robot_set_body_euler` | Body orientation (roll, pitch, yaw) |
+| `robot_capture_image` | Capture fresh camera image |
+| `robot_set_speed_level` | Speed: 0=slow, 1=medium, 2=fast |
+| `robot_set_volume` | Speaker volume (0-10) |
 
-This project is experimental and we welcome contributions! If you find a bug or have a suggestion:
+### Sport Actions
 
-- **Report issues** on the [GitHub Issues](https://github.com/Josh-XT/go2control/issues) page
-- **Pull requests** are always welcome — if you find an issue you can fix, we'd love the help
+`balance_stand`, `sit`, `stand_up`, `stand_down`, `hello`, `stretch`, `dance1`, `dance2`, `heart`, `pose`, `front_flip`, `back_flip`, `left_flip`, `hand_stand`, `free_walk`, and more.
 
-## License
+## Connection Modes
 
-MIT — Use at your own risk. This is unofficial/experimental code.
+### DDS (Recommended for Pi 5)
+- Connect Pi to Go2 via Ethernet cable
+- Robot IP: `192.168.123.161` (default)
+- Requires `unitree_sdk2py` package
+- Most reliable, lowest latency
+
+### WebRTC (Future)
+- WiFi connection to Go2's access point
+- Robot IP: `192.168.12.1` (AP mode)
+- Requires `unitree_webrtc_connect` package (not yet Pi5 compatible)
+
+## How "Walk to the Ball" Works
+
+1. User says "Walk to that ball"
+2. AGiXT sees the ball in the camera feed (via periodic `image.input` frames)
+3. AGiXT uses vision to identify the ball's position in frame
+4. AGiXT calls `robot_move` to walk forward
+5. AGiXT calls `robot_capture_image` to check progress
+6. AGiXT adjusts direction based on new image
+7. Repeat until close enough
+8. AGiXT narrates progress through TTS: "I can see the ball, walking toward it..."

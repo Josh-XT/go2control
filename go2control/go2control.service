@@ -1,15 +1,18 @@
 [Unit]
-Description=Unitree Go2 Pro Robot Control API
+Description=Go2 Control — AGiXT Voice Client for Unitree Go2 Pro
 After=network.target
 
 [Service]
 Type=simple
 User=pi
 WorkingDirectory=/home/pi/go2control/go2control
-ExecStart=/usr/bin/python3 api_server.py
+ExecStart=/usr/bin/python3 go2_client.py --config config.yaml
 Restart=always
 RestartSec=5
 Environment=GO2_SIMULATION=false
+# Set these for your environment:
+# Environment=AGIXT_SERVER=ws://your-agixt-server:7437
+# Environment=AGIXT_JWT=your-jwt-token
 
 [Install]
 WantedBy=multi-user.target

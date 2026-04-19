@@ -1,8 +1,6 @@
-httpx
-pyserial
-pyyaml
-uvicorn[standard]
-fastapi
 websockets
+httpx
 numpy
 opencv-python-headless
+pyyaml
+unitree_sdk2py
