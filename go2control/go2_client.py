@@ -445,17 +445,31 @@ class Go2Robot:
             raise
 
     def _init_audio(self):
-        """Initialize PyAudio for playback and capture."""
+        """Initialize PyAudio for playback and capture.
+        
+        Streams are opened independently so a capture failure doesn't
+        prevent playback (and vice versa).
+        """
         if not PYAUDIO_AVAILABLE:
             log.warning("[Audio] PyAudio not available — audio disabled")
             return
+
+        # Close existing streams/instance before reinit
+        self.cleanup_audio()
+
         try:
             self._pa = pyaudio.PyAudio()
-            audio_cfg = self.config.get("audio", {})
+        except Exception as e:
+            log.error(f"[Audio] Failed to create PyAudio instance: {e}")
+            self._pa = None
+            return
 
-            # Open playback stream (24kHz 16-bit mono from AGiXT TTS)
-            playback_rate = audio_cfg.get("playback_sample_rate", 24000)
-            output_dev = audio_cfg.get("output_device", None)
+        audio_cfg = self.config.get("audio", {})
+
+        # Open playback stream (24kHz 16-bit mono from AGiXT TTS)
+        playback_rate = audio_cfg.get("playback_sample_rate", 24000)
+        output_dev = audio_cfg.get("output_device", None)
+        try:
             self._playback_stream = self._pa.open(
                 format=pyaudio.paInt16,
                 channels=1,
@@ -464,10 +478,14 @@ class Go2Robot:
                 output_device_index=output_dev,
                 frames_per_buffer=2048,
             )
+        except Exception as e:
+            log.error(f"[Audio] Playback stream failed: {e}")
+            self._playback_stream = None
 
-            # Open capture stream (16kHz 16-bit mono for Whisper STT)
-            capture_rate = audio_cfg.get("sample_rate", 16000)
-            input_dev = audio_cfg.get("input_device", None)
+        # Open capture stream (16kHz 16-bit mono for Whisper STT)
+        capture_rate = audio_cfg.get("sample_rate", 16000)
+        input_dev = audio_cfg.get("input_device", None)
+        try:
             self._capture_stream = self._pa.open(
                 format=pyaudio.paInt16,
                 channels=1,
@@ -476,16 +494,19 @@ class Go2Robot:
                 input_device_index=input_dev,
                 frames_per_buffer=1024,
             )
-
-            log.info(
-                f"[Audio] PyAudio initialized (playback={playback_rate}Hz, "
-                f"capture={capture_rate}Hz)"
-            )
         except Exception as e:
-            log.error(f"[Audio] Failed to initialize PyAudio: {e}")
-            self._pa = None
-            self._playback_stream = None
+            log.error(f"[Audio] Capture stream failed: {e}")
             self._capture_stream = None
+
+        status = []
+        if self._playback_stream:
+            status.append(f"playback={playback_rate}Hz")
+        if self._capture_stream:
+            status.append(f"capture={capture_rate}Hz")
+        if status:
+            log.info(f"[Audio] PyAudio initialized ({', '.join(status)})")
+        else:
+            log.error("[Audio] PyAudio initialized but no streams opened")
 
     def play_audio_chunk(self, pcm_data: bytes):
         """Play a PCM audio chunk through the speaker. Called from event loop."""
@@ -626,20 +647,17 @@ class Go2Robot:
             while time.time() < end_time:
                 self._sport_client.Move(vx, vy, vyaw)
                 await asyncio.sleep(0.05)
-            # Stop
-            self._sport_client.StopMove()
         except Exception as e:
             log.error(f"[Robot] Move error: {e}")
+            return f"Error during move: {e}"
+        finally:
+            # ALWAYS stop the robot, even if an error occurred
             try:
                 self._sport_client.StopMove()
             except Exception:
                 pass
             self._is_moving = False
             self._current_posture = "standing"
-            return f"Error during move: {e}"
-
-        self._is_moving = False
-        self._current_posture = "standing"
 
         return (
             f"Move complete: vx={vx:.2f} vy={vy:.2f} vyaw={vyaw:.2f} "
@@ -795,6 +813,8 @@ class AGiXTVoiceClient:
         # Audio playback state
         self._playing_audio = False
         self._audio_interrupted = False
+        self._audio_stop_time = 0.0  # time.time() when playback ended
+        self._echo_tail_s = 0.15  # seconds to suppress mic after playback
 
         # Adaptive camera: faster rate during movement
         self._camera_base_interval = config["camera"].get("interval", 3.0)
@@ -812,8 +832,9 @@ class AGiXTVoiceClient:
         self._ws = await websockets.connect(
             ws_url,
             max_size=50 * 1024 * 1024,  # 50MB for images
-            ping_interval=20,
-            ping_timeout=30,
+            ping_interval=10,  # Ping every 10s (WiFi-friendly)
+            ping_timeout=15,  # 15s pong timeout
+            close_timeout=5,  # Fast close on error
         )
 
         # Wait for ready status
@@ -846,85 +867,116 @@ class AGiXTVoiceClient:
         self._ready.set()
 
     async def run(self):
-        """Main event loop — processes incoming messages from AGiXT."""
-        try:
-            async for message in self._ws:
+        """Main event loop — processes incoming messages from AGiXT.
+        Auto-reconnects on disconnection with exponential backoff."""
+        reconnect_delay = 1.0
+        max_reconnect_delay = 60.0
+
+        while self._running:
+            try:
+                async for message in self._ws:
+                    if not self._running:
+                        break
+
+                    if isinstance(message, bytes):
+                        # TTS audio from AGiXT — play through robot speaker
+                        if self._audio_interrupted:
+                            continue  # Discard audio chunks after interrupt
+                        self._playing_audio = True
+                        loop = asyncio.get_event_loop()
+                        await loop.run_in_executor(
+                            None, self.robot.play_audio_chunk, message
+                        )
+                        continue
+
+                    try:
+                        data = json.loads(message)
+                    except json.JSONDecodeError:
+                        continue
+
+                    msg_type = data.get("type", "")
+
+                    if msg_type == "status":
+                        state = data.get("data", {}).get("state", "")
+                        log.info(f"[AGiXT] State: {state}")
+
+                    elif msg_type == "transcript.user":
+                        text = data.get("data", {}).get("text", "")
+                        if text:
+                            log.info(f"[AGiXT] Heard: {text}")
+
+                    elif msg_type == "transcript.agent":
+                        text = data.get("data", {}).get("text", "")
+                        role = data.get("data", {}).get("role", "")
+                        if text:
+                            log.info(f"[AGiXT] [{role}]: {text}")
+
+                    elif msg_type == "tool.request":
+                        req_data = data.get("data", {})
+                        asyncio.ensure_future(self._handle_tool_request(req_data))
+
+                    elif msg_type == "session.end":
+                        reason = data.get("data", {}).get("reason", "")
+                        log.info(f"[AGiXT] Session ended: {reason}")
+
+                    elif msg_type == "audio.header":
+                        # New audio stream starting — reset interrupt flag
+                        self._audio_interrupted = False
+                        self._playing_audio = True
+                        log.debug(f"[AGiXT] Audio header: {data.get('data', {})}")
+
+                    elif msg_type == "audio.end":
+                        self._playing_audio = False
+                        self._audio_stop_time = time.time()
+                        log.debug("[AGiXT] Audio stream ended")
+
+                    elif msg_type == "audio.interrupt":
+                        # Stop playback immediately
+                        self._audio_interrupted = True
+                        self._playing_audio = False
+                        self._audio_stop_time = time.time()
+                        loop = asyncio.get_event_loop()
+                        await loop.run_in_executor(None, self.robot.stop_playback)
+                        log.debug("[AGiXT] Audio interrupted — playback stopped")
+
+                    elif msg_type == "heartbeat":
+                        pass  # keepalive, ignore
+
+                    elif msg_type == "error":
+                        log.error(
+                            f"[AGiXT] Error: {data.get('data', {}).get('message', '')}"
+                        )
+
+            except websockets.ConnectionClosed as e:
                 if not self._running:
                     break
-
-                if isinstance(message, bytes):
-                    # TTS audio from AGiXT — play through robot speaker
-                    if self._audio_interrupted:
-                        continue  # Discard audio chunks after interrupt
-                    self._playing_audio = True
-                    loop = asyncio.get_event_loop()
-                    await loop.run_in_executor(
-                        None, self.robot.play_audio_chunk, message
-                    )
-                    continue
-
+                log.warning(
+                    f"[AGiXT] Connection closed: {e}. "
+                    f"Reconnecting in {reconnect_delay:.0f}s..."
+                )
+                self._playing_audio = False
+                await asyncio.sleep(reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)
                 try:
-                    data = json.loads(message)
-                except json.JSONDecodeError:
+                    await self.connect()
+                    reconnect_delay = 1.0  # Reset on success
+                    log.info("[AGiXT] Reconnected successfully")
+                except Exception as e2:
+                    log.error(f"[AGiXT] Reconnection failed: {e2}")
                     continue
-
-                msg_type = data.get("type", "")
-
-                if msg_type == "status":
-                    state = data.get("data", {}).get("state", "")
-                    log.info(f"[AGiXT] State: {state}")
-
-                elif msg_type == "transcript.user":
-                    text = data.get("data", {}).get("text", "")
-                    if text:
-                        log.info(f"[AGiXT] Heard: {text}")
-
-                elif msg_type == "transcript.agent":
-                    text = data.get("data", {}).get("text", "")
-                    role = data.get("data", {}).get("role", "")
-                    if text:
-                        log.info(f"[AGiXT] [{role}]: {text}")
-
-                elif msg_type == "tool.request":
-                    req_data = data.get("data", {})
-                    asyncio.ensure_future(self._handle_tool_request(req_data))
-
-                elif msg_type == "session.end":
-                    reason = data.get("data", {}).get("reason", "")
-                    log.info(f"[AGiXT] Session ended: {reason}")
-
-                elif msg_type == "audio.header":
-                    # New audio stream starting — reset interrupt flag
-                    self._audio_interrupted = False
-                    self._playing_audio = True
-                    log.debug(f"[AGiXT] Audio header: {data.get('data', {})}")
-
-                elif msg_type == "audio.end":
-                    self._playing_audio = False
-                    log.debug("[AGiXT] Audio stream ended")
-
-                elif msg_type == "audio.interrupt":
-                    # Stop playback immediately
-                    self._audio_interrupted = True
-                    self._playing_audio = False
-                    loop = asyncio.get_event_loop()
-                    await loop.run_in_executor(None, self.robot.stop_playback)
-                    log.debug("[AGiXT] Audio interrupted — playback stopped")
-
-                elif msg_type == "heartbeat":
-                    pass  # keepalive, ignore
-
-                elif msg_type == "error":
-                    log.error(
-                        f"[AGiXT] Error: {data.get('data', {}).get('message', '')}"
-                    )
-
-        except websockets.ConnectionClosed as e:
-            log.warning(f"[AGiXT] Connection closed: {e}")
-        except Exception as e:
-            log.error(f"[AGiXT] Error in message loop: {e}", exc_info=True)
-        finally:
-            self._running = False
+            except Exception as e:
+                if not self._running:
+                    break
+                log.error(f"[AGiXT] Error in message loop: {e}", exc_info=True)
+                self._playing_audio = False
+                await asyncio.sleep(reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)
+                try:
+                    await self.connect()
+                    reconnect_delay = 1.0
+                except Exception as e2:
+                    log.error(f"[AGiXT] Reconnection failed: {e2}")
+                    continue
 
     async def _handle_tool_request(self, req_data: dict):
         """Execute a tool request from AGiXT on the robot."""
@@ -1034,6 +1086,10 @@ class AGiXTVoiceClient:
             f"moving={self._camera_moving_interval}s, q={quality})"
         )
 
+        consecutive_errors = 0
+        max_errors_before_backoff = 5
+        backoff_duration = 30.0
+
         while self._running:
             try:
                 jpeg_bytes, _ = await self.robot.capture_image()
@@ -1046,8 +1102,22 @@ class AGiXTVoiceClient:
                         f"[Camera] Sent frame ({len(jpeg_bytes)} bytes, "
                         f"{len(b64)} b64)"
                     )
+                    consecutive_errors = 0
+                else:
+                    consecutive_errors += 1
             except Exception as e:
+                consecutive_errors += 1
                 log.debug(f"[Camera] Frame error: {e}")
+
+            # Back off if camera is consistently failing
+            if consecutive_errors >= max_errors_before_backoff:
+                log.warning(
+                    f"[Camera] {consecutive_errors} consecutive failures, "
+                    f"backing off for {backoff_duration}s"
+                )
+                await asyncio.sleep(backoff_duration)
+                consecutive_errors = 0
+                continue
 
             # Adaptive interval: fast when robot is moving, slow when idle
             if self.robot._is_moving:
@@ -1080,10 +1150,15 @@ class AGiXTVoiceClient:
                 "[Audio] No capture stream available — audio input disabled. "
                 "Install PyAudio and check microphone."
             )
-            # Keep loop alive for future reconnect
+            # Keep loop alive — retry audio init periodically
             while self._running:
-                await asyncio.sleep(5.0)
-            return
+                await asyncio.sleep(30.0)
+                self.robot._init_audio()
+                if self.robot._capture_stream:
+                    log.info("[Audio] Capture stream recovered, starting capture")
+                    break
+            if not self._running:
+                return
 
         sample_rate = self.audio_config.get("sample_rate", 16000)
         chunk_duration = self.audio_config.get("chunk_duration", 0.5)
@@ -1093,6 +1168,7 @@ class AGiXTVoiceClient:
 
         chunk_frames = int(sample_rate * chunk_duration)
         loop = asyncio.get_event_loop()
+        max_buffer_bytes = 5 * 1024 * 1024  # 5MB hard limit on speech buffer
 
         log.info(
             f"[Audio] Capture started (rate={sample_rate}Hz, "
@@ -1104,6 +1180,8 @@ class AGiXTVoiceClient:
         is_speaking = False
         silence_start = 0.0
         speech_start = 0.0
+        consecutive_read_errors = 0
+        max_read_errors = 30  # ~15s at 0.5s chunks
 
         while self._running:
             try:
@@ -1112,11 +1190,25 @@ class AGiXTVoiceClient:
                     None, self.robot.read_audio_chunk, chunk_frames
                 )
                 if not pcm_data:
+                    consecutive_read_errors += 1
+                    if consecutive_read_errors >= max_read_errors:
+                        log.error(
+                            "[Audio] Microphone unresponsive — "
+                            "attempting reinitialize"
+                        )
+                        self.robot._init_audio()
+                        consecutive_read_errors = 0
+                        if not self.robot._capture_stream:
+                            log.error("[Audio] Reinit failed, waiting 30s")
+                            await asyncio.sleep(30.0)
                     await asyncio.sleep(0.1)
                     continue
+                consecutive_read_errors = 0
 
-                # Don't capture while robot is speaking (echo suppression)
-                if self._playing_audio:
+                # Echo suppression: skip capture during playback + tail
+                if self._playing_audio or (
+                    time.time() - self._audio_stop_time < self._echo_tail_s
+                ):
                     continue
 
                 # Compute RMS energy for VAD
@@ -1154,11 +1246,17 @@ class AGiXTVoiceClient:
                             is_speaking = False
                             silence_start = 0.0
 
-                # Force send if max speech duration exceeded
-                if is_speaking and (now - speech_start) >= max_speech:
-                    log.info(
-                        f"[Audio] Max speech duration ({max_speech}s) — sending"
+                # Force send if max speech duration or buffer size exceeded
+                if is_speaking and (
+                    (now - speech_start) >= max_speech
+                    or len(speech_buffer) >= max_buffer_bytes
+                ):
+                    reason = (
+                        "buffer overflow"
+                        if len(speech_buffer) >= max_buffer_bytes
+                        else f"max duration ({max_speech}s)"
                     )
+                    log.info(f"[Audio] {reason} — sending")
                     await self._send_speech_audio(
                         bytes(speech_buffer), sample_rate
                     )
@@ -1262,7 +1360,14 @@ async def main(config: dict):
         tasks.append(asyncio.ensure_future(_interactive_input(client)))
 
     try:
-        await asyncio.gather(*tasks, return_exceptions=True)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        # Report any task failures
+        task_names = ["message_handler", "camera_loop", "audio_loop"]
+        if sys.stdin.isatty():
+            task_names.append("interactive_input")
+        for name, result in zip(task_names, results):
+            if isinstance(result, Exception):
+                log.error(f"[Main] Task '{name}' failed: {result}")
     except KeyboardInterrupt:
         pass
     finally:
