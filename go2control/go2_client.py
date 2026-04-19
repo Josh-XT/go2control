@@ -471,9 +471,7 @@ class Go2Robot:
             log.error(f"[Robot] Action error: {e}")
             return f"Error executing '{action_name}': {e}"
 
-    async def set_body_euler(
-        self, roll: float, pitch: float, yaw: float
-    ) -> str:
+    async def set_body_euler(self, roll: float, pitch: float, yaw: float) -> str:
         """Set body orientation."""
         roll = self._clamp(roll, 0.75)
         pitch = self._clamp(pitch, 0.75)
@@ -613,9 +611,7 @@ class AGiXTVoiceClient:
         # Configure agent if specified
         agent = self.agixt_config.get("agent", "XT")
         if agent != "XT":
-            await self._ws.send(
-                json.dumps({"type": "config", "agent": agent})
-            )
+            await self._ws.send(json.dumps({"type": "config", "agent": agent}))
 
         # Register robot tools
         await self._ws.send(
@@ -735,9 +731,7 @@ class AGiXTVoiceClient:
                 ),
             )
         elif tool_name == "robot_action":
-            return await self.robot.execute_action(
-                tool_args.get("action", "")
-            )
+            return await self.robot.execute_action(tool_args.get("action", ""))
         elif tool_name == "robot_set_body_euler":
             return await self.robot.set_body_euler(
                 roll=float(tool_args.get("roll", 0)),
@@ -749,19 +743,13 @@ class AGiXTVoiceClient:
             if jpeg_bytes:
                 # Send the captured image to AGiXT as vision context
                 b64 = base64.b64encode(jpeg_bytes).decode()
-                await self._ws.send(
-                    json.dumps({"type": "image.input", "data": b64})
-                )
+                await self._ws.send(json.dumps({"type": "image.input", "data": b64}))
                 return f"Image captured and sent. {description}"
             return description
         elif tool_name == "robot_set_speed_level":
-            return await self.robot.set_speed_level(
-                int(tool_args.get("level", 1))
-            )
+            return await self.robot.set_speed_level(int(tool_args.get("level", 1)))
         elif tool_name == "robot_set_volume":
-            return await self.robot.set_volume(
-                int(tool_args.get("level", 5))
-            )
+            return await self.robot.set_volume(int(tool_args.get("level", 5)))
         else:
             return f"Error: Unknown tool '{tool_name}'"
 
@@ -830,18 +818,14 @@ class AGiXTVoiceClient:
     async def send_text(self, text: str):
         """Send a text message to AGiXT (for testing without audio)."""
         if self._ws and self._running:
-            await self._ws.send(
-                json.dumps({"type": "text.input", "text": text})
-            )
+            await self._ws.send(json.dumps({"type": "text.input", "text": text}))
             log.info(f"[Send] Text: {text}")
 
     async def send_audio(self, wav_data: bytes):
         """Send audio data to AGiXT."""
         if self._ws and self._running:
             await self._ws.send(wav_data)
-            await self._ws.send(
-                json.dumps({"type": "audio.input.end"})
-            )
+            await self._ws.send(json.dumps({"type": "audio.input.end"}))
             log.info(f"[Send] Audio: {len(wav_data)} bytes")
 
     async def stop(self):
@@ -867,7 +851,9 @@ async def main(config: dict):
     except Exception as e:
         log.error(f"Failed to connect to robot: {e}")
         if not config.get("simulation"):
-            log.info("Tip: Set simulation=true in config or GO2_SIMULATION=true to test without robot")
+            log.info(
+                "Tip: Set simulation=true in config or GO2_SIMULATION=true to test without robot"
+            )
             return
         raise
 
@@ -881,7 +867,9 @@ async def main(config: dict):
 
     log.info("=" * 50)
     log.info("Go2 Control is running!")
-    log.info("  Robot: Connected" + (" (simulation)" if config.get("simulation") else ""))
+    log.info(
+        "  Robot: Connected" + (" (simulation)" if config.get("simulation") else "")
+    )
     log.info(f"  AGiXT: {config['agixt']['server']}")
     log.info("  Camera streaming: " + ("ON" if config["camera"]["enabled"] else "OFF"))
     log.info("  Audio capture: " + ("ON" if config["audio"]["enabled"] else "OFF"))
