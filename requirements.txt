@@ -3,4 +3,5 @@ httpx
 numpy
 opencv-python-headless
 pyyaml
+pyaudio
 unitree_sdk2py

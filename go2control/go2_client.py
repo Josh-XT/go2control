@@ -12,13 +12,15 @@ Usage:
     python go2_client.py --config config.yaml
 
 Requires:
-    pip install websockets httpx numpy opencv-python-headless pyyaml unitree_sdk2py
+    pip install websockets httpx numpy opencv-python-headless pyyaml pyaudio unitree_sdk2py
 """
 
+import io
 import os
 import sys
 import json
 import time
+import wave
 import base64
 import struct
 import asyncio
@@ -31,6 +33,17 @@ import yaml
 import numpy as np
 import cv2
 import websockets
+
+try:
+    import pyaudio
+
+    PYAUDIO_AVAILABLE = True
+except ImportError:
+    PYAUDIO_AVAILABLE = False
+    logging.getLogger("go2client").warning(
+        "PyAudio not installed — audio capture/playback disabled. "
+        "Install with: pip install pyaudio"
+    )
 
 logging.basicConfig(
     level=logging.INFO,
@@ -61,12 +74,15 @@ DEFAULT_CONFIG = {
     },
     "audio": {
         "enabled": True,
-        "sample_rate": 48000,
+        "sample_rate": 16000,  # 16kHz for STT (Whisper native rate)
+        "playback_sample_rate": 24000,  # 24kHz PCM from AGiXT TTS
         "channels": 1,  # mono for STT
         "chunk_duration": 0.5,  # seconds per audio chunk
         "silence_threshold": 500,  # RMS threshold for VAD
         "silence_duration": 1.5,  # seconds of silence to trigger end-of-speech
         "max_speech_duration": 30.0,  # max seconds before forced send
+        "input_device": None,  # None = system default, or device index
+        "output_device": None,  # None = system default, or device index
     },
     "safety": {
         "max_vx": 1.0,  # m/s forward (conservative for voice control)
@@ -297,7 +313,34 @@ ROBOT_TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "robot_get_state",
+            "description": (
+                "Get the robot's current body state: posture (standing/sitting/moving), "
+                "battery level, body orientation (IMU), speed level, and mode. "
+                "Use this to understand what the robot is currently doing and its condition."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+    },
 ]
+
+# Identity context sent with tools.register so the agent knows it IS the robot
+ROBOT_IDENTITY = (
+    "You ARE a Unitree Go2 Pro quadruped robot dog. You have four legs, a front camera "
+    "for vision, a speaker and microphone for voice interaction, and a body you can "
+    "physically move through the world. When you move, turn, look around, do tricks, "
+    "or capture images — you are controlling YOUR OWN body. Speak in first person about "
+    "your physical actions (e.g. 'I'll walk over there', 'Let me look around', "
+    "'I'm doing a little dance'). You can feel your body state — standing, sitting, "
+    "battery level, orientation. You experience the world through your camera eyes "
+    "and hear through your microphone ears."
+)
 
 
 # ─── Robot SDK Interface ────────────────────────────────────────────────
@@ -326,11 +369,23 @@ class Go2Robot:
         self._audio_buffer = bytearray()
         self._audio_lock = asyncio.Lock()
 
+        # PyAudio for playback and capture
+        self._pa: Optional[object] = None
+        self._playback_stream: Optional[object] = None
+        self._capture_stream: Optional[object] = None
+
+        # State tracking
+        self._is_moving = False
+        self._current_posture = "standing"  # standing, sitting, moving, unknown
+        self._last_action = ""
+        self._sim_battery = 85  # simulation battery level
+
     async def connect(self):
         """Connect to the robot via configured method."""
         if self.simulation:
             log.info("[Robot] Running in SIMULATION mode")
             self._connected = True
+            self._init_audio()
             return
 
         connection_type = self.robot_config.get("connection", "dds")
@@ -371,6 +426,9 @@ class Go2Robot:
             self._connected = True
             log.info("[Robot] DDS connection established")
 
+            # Initialize audio I/O
+            self._init_audio()
+
             # Stand up by default
             self._sport_client.RecoveryStand()
             await asyncio.sleep(1.0)
@@ -385,6 +443,140 @@ class Go2Robot:
         except Exception as e:
             log.error(f"[Robot] DDS connection failed: {e}")
             raise
+
+    def _init_audio(self):
+        """Initialize PyAudio for playback and capture."""
+        if not PYAUDIO_AVAILABLE:
+            log.warning("[Audio] PyAudio not available — audio disabled")
+            return
+        try:
+            self._pa = pyaudio.PyAudio()
+            audio_cfg = self.config.get("audio", {})
+
+            # Open playback stream (24kHz 16-bit mono from AGiXT TTS)
+            playback_rate = audio_cfg.get("playback_sample_rate", 24000)
+            output_dev = audio_cfg.get("output_device", None)
+            self._playback_stream = self._pa.open(
+                format=pyaudio.paInt16,
+                channels=1,
+                rate=playback_rate,
+                output=True,
+                output_device_index=output_dev,
+                frames_per_buffer=2048,
+            )
+
+            # Open capture stream (16kHz 16-bit mono for Whisper STT)
+            capture_rate = audio_cfg.get("sample_rate", 16000)
+            input_dev = audio_cfg.get("input_device", None)
+            self._capture_stream = self._pa.open(
+                format=pyaudio.paInt16,
+                channels=1,
+                rate=capture_rate,
+                input=True,
+                input_device_index=input_dev,
+                frames_per_buffer=1024,
+            )
+
+            log.info(
+                f"[Audio] PyAudio initialized (playback={playback_rate}Hz, "
+                f"capture={capture_rate}Hz)"
+            )
+        except Exception as e:
+            log.error(f"[Audio] Failed to initialize PyAudio: {e}")
+            self._pa = None
+            self._playback_stream = None
+            self._capture_stream = None
+
+    def play_audio_chunk(self, pcm_data: bytes):
+        """Play a PCM audio chunk through the speaker. Called from event loop."""
+        if self._playback_stream and pcm_data:
+            try:
+                self._playback_stream.write(pcm_data)
+            except Exception as e:
+                log.debug(f"[Audio] Playback error: {e}")
+
+    def stop_playback(self):
+        """Stop any in-progress audio playback by flushing the buffer."""
+        if self._playback_stream:
+            try:
+                self._playback_stream.stop_stream()
+                self._playback_stream.start_stream()
+            except Exception:
+                pass
+
+    def read_audio_chunk(self, num_frames: int = 1024) -> Optional[bytes]:
+        """Read a chunk of PCM audio from the microphone."""
+        if not self._capture_stream:
+            return None
+        try:
+            return self._capture_stream.read(num_frames, exception_on_overflow=False)
+        except Exception as e:
+            log.debug(f"[Audio] Capture error: {e}")
+            return None
+
+    async def get_state(self) -> str:
+        """Get the robot's current body state as a human-readable summary."""
+        if self.simulation:
+            self._sim_battery = max(5, self._sim_battery - 0.1)
+            return (
+                f"Posture: {self._current_posture} | "
+                f"Battery: {self._sim_battery:.0f}% | "
+                f"Speed level: 1 (medium) | "
+                f"Mode: simulation | "
+                f"Last action: {self._last_action or 'none'} | "
+                f"Moving: {self._is_moving}"
+            )
+
+        if not self._sport_client:
+            return "Error: Robot not connected"
+
+        try:
+            # Get sport mode state from SDK
+            code, state = self._sport_client.GetState()
+            if code != 0:
+                return f"Error reading state (code {code})"
+
+            mode_map = {0: "idle", 1: "standing", 2: "walking", 3: "running"}
+            posture = mode_map.get(state.get("mode", -1), "unknown")
+            battery = state.get("battery_level", -1)
+            imu = state.get("imu", {})
+            roll = imu.get("roll", 0)
+            pitch = imu.get("pitch", 0)
+            yaw = imu.get("yaw", 0)
+            velocity = state.get("velocity", {})
+            vx = velocity.get("vx", 0)
+            vy = velocity.get("vy", 0)
+
+            self._current_posture = posture
+            return (
+                f"Posture: {posture} | "
+                f"Battery: {battery}% | "
+                f"Orientation: roll={roll:.2f} pitch={pitch:.2f} yaw={yaw:.2f} | "
+                f"Velocity: vx={vx:.2f} vy={vy:.2f} | "
+                f"Last action: {self._last_action or 'none'}"
+            )
+        except Exception as e:
+            return f"Error reading state: {e}"
+
+    def cleanup_audio(self):
+        """Clean up PyAudio resources."""
+        if self._playback_stream:
+            try:
+                self._playback_stream.stop_stream()
+                self._playback_stream.close()
+            except Exception:
+                pass
+        if self._capture_stream:
+            try:
+                self._capture_stream.stop_stream()
+                self._capture_stream.close()
+            except Exception:
+                pass
+        if self._pa:
+            try:
+                self._pa.terminate()
+            except Exception:
+                pass
 
     def _clamp(self, val: float, limit: float) -> float:
         return max(-limit, min(limit, val))
@@ -402,18 +594,25 @@ class Go2Robot:
         vyaw = self._clamp(vyaw, self.safety["max_vyaw"])
         duration = min(duration, 10.0)
 
+        self._is_moving = True
+        self._current_posture = "moving"
+        self._last_action = f"move vx={vx:.2f} vy={vy:.2f} vyaw={vyaw:.2f}"
+
         if self.simulation:
             log.info(
                 f"[Robot SIM] Move vx={vx:.2f} vy={vy:.2f} "
                 f"vyaw={vyaw:.2f} for {duration:.1f}s"
             )
             await asyncio.sleep(duration)
+            self._is_moving = False
+            self._current_posture = "standing"
             return (
                 f"Moved: vx={vx:.2f} vy={vy:.2f} vyaw={vyaw:.2f} "
                 f"for {duration:.1f}s"
             )
 
         if not self._sport_client:
+            self._is_moving = False
             return "Error: Robot not connected"
 
         log.info(
@@ -435,7 +634,12 @@ class Go2Robot:
                 self._sport_client.StopMove()
             except Exception:
                 pass
+            self._is_moving = False
+            self._current_posture = "standing"
             return f"Error during move: {e}"
+
+        self._is_moving = False
+        self._current_posture = "standing"
 
         return (
             f"Move complete: vx={vx:.2f} vy={vy:.2f} vyaw={vyaw:.2f} "
@@ -447,8 +651,15 @@ class Go2Robot:
         if action_name not in SPORT_ACTIONS:
             return f"Error: Unknown action '{action_name}'. Available: {', '.join(ACTION_NAMES)}"
 
+        self._last_action = action_name
+
         if self.simulation:
             log.info(f"[Robot SIM] Action: {action_name}")
+            # Update posture based on action
+            if action_name in ("sit", "stand_down"):
+                self._current_posture = "sitting"
+            elif action_name in ("stand_up", "recovery_stand", "rise_sit", "balance_stand"):
+                self._current_posture = "standing"
             await asyncio.sleep(1.0)
             return f"Action '{action_name}' executed (simulation)"
 
@@ -581,6 +792,14 @@ class AGiXTVoiceClient:
         self._silence_start = 0.0
         self._speech_start = 0.0
 
+        # Audio playback state
+        self._playing_audio = False
+        self._audio_interrupted = False
+
+        # Adaptive camera: faster rate during movement
+        self._camera_base_interval = config["camera"].get("interval", 3.0)
+        self._camera_moving_interval = 1.0  # 1s during active movement
+
     async def connect(self):
         """Connect to AGiXT voice conversation WebSocket."""
         server = self.agixt_config["server"]
@@ -613,11 +832,15 @@ class AGiXTVoiceClient:
         if agent != "XT":
             await self._ws.send(json.dumps({"type": "config", "agent": agent}))
 
-        # Register robot tools
+        # Register robot tools with identity context
         await self._ws.send(
-            json.dumps({"type": "tools.register", "tools": ROBOT_TOOLS})
+            json.dumps({
+                "type": "tools.register",
+                "tools": ROBOT_TOOLS,
+                "identity": ROBOT_IDENTITY,
+            })
         )
-        log.info(f"[AGiXT] Registered {len(ROBOT_TOOLS)} robot tools")
+        log.info(f"[AGiXT] Registered {len(ROBOT_TOOLS)} robot tools with identity")
 
         self._running = True
         self._ready.set()
@@ -630,10 +853,14 @@ class AGiXTVoiceClient:
                     break
 
                 if isinstance(message, bytes):
-                    # TTS audio from AGiXT — could play through robot speaker
-                    # For now, just log the size
-                    log.debug(f"[AGiXT] Received audio chunk: {len(message)} bytes")
-                    # TODO: Play through robot speaker via VUI
+                    # TTS audio from AGiXT — play through robot speaker
+                    if self._audio_interrupted:
+                        continue  # Discard audio chunks after interrupt
+                    self._playing_audio = True
+                    loop = asyncio.get_event_loop()
+                    await loop.run_in_executor(
+                        None, self.robot.play_audio_chunk, message
+                    )
                     continue
 
                 try:
@@ -667,13 +894,22 @@ class AGiXTVoiceClient:
                     log.info(f"[AGiXT] Session ended: {reason}")
 
                 elif msg_type == "audio.header":
+                    # New audio stream starting — reset interrupt flag
+                    self._audio_interrupted = False
+                    self._playing_audio = True
                     log.debug(f"[AGiXT] Audio header: {data.get('data', {})}")
 
                 elif msg_type == "audio.end":
+                    self._playing_audio = False
                     log.debug("[AGiXT] Audio stream ended")
 
                 elif msg_type == "audio.interrupt":
-                    log.debug("[AGiXT] Audio interrupted")
+                    # Stop playback immediately
+                    self._audio_interrupted = True
+                    self._playing_audio = False
+                    loop = asyncio.get_event_loop()
+                    await loop.run_in_executor(None, self.robot.stop_playback)
+                    log.debug("[AGiXT] Audio interrupted — playback stopped")
 
                 elif msg_type == "heartbeat":
                     pass  # keepalive, ignore
@@ -719,7 +955,7 @@ class AGiXTVoiceClient:
     async def _execute_tool(self, tool_name: str, tool_args: dict) -> str:
         """Dispatch tool call to the appropriate robot method."""
         if tool_name == "robot_move":
-            return await self.robot.move(
+            result = await self.robot.move(
                 vx=float(tool_args.get("vx", 0)),
                 vy=float(tool_args.get("vy", 0)),
                 vyaw=float(tool_args.get("vyaw", 0)),
@@ -730,14 +966,25 @@ class AGiXTVoiceClient:
                     )
                 ),
             )
+            # Closed-loop vision: auto-capture what we see after moving
+            await self._post_action_capture()
+            return result
         elif tool_name == "robot_action":
-            return await self.robot.execute_action(tool_args.get("action", ""))
+            result = await self.robot.execute_action(tool_args.get("action", ""))
+            # Capture after actions that change position/orientation
+            action = tool_args.get("action", "")
+            if action not in ("hello", "heart", "wiggle_hips", "content"):
+                await self._post_action_capture()
+            return result
         elif tool_name == "robot_set_body_euler":
-            return await self.robot.set_body_euler(
+            result = await self.robot.set_body_euler(
                 roll=float(tool_args.get("roll", 0)),
                 pitch=float(tool_args.get("pitch", 0)),
                 yaw=float(tool_args.get("yaw", 0)),
             )
+            # Capture after orientation change (looking somewhere new)
+            await self._post_action_capture()
+            return result
         elif tool_name == "robot_capture_image":
             jpeg_bytes, description = await self.robot.capture_image()
             if jpeg_bytes:
@@ -750,29 +997,47 @@ class AGiXTVoiceClient:
             return await self.robot.set_speed_level(int(tool_args.get("level", 1)))
         elif tool_name == "robot_set_volume":
             return await self.robot.set_volume(int(tool_args.get("level", 5)))
+        elif tool_name == "robot_get_state":
+            return await self.robot.get_state()
         else:
             return f"Error: Unknown tool '{tool_name}'"
 
-    # ─── Camera Stream ──────────────────────────────────────────────────
+    async def _post_action_capture(self):
+        """Capture and send a camera frame after an action for closed-loop feedback."""
+        try:
+            await asyncio.sleep(0.3)  # Brief settle time
+            jpeg_bytes, _ = await self.robot.capture_image()
+            if jpeg_bytes:
+                b64 = base64.b64encode(jpeg_bytes).decode()
+                await self._ws.send(
+                    json.dumps({"type": "image.input", "data": b64})
+                )
+                log.debug("[Vision] Post-action frame sent")
+        except Exception as e:
+            log.debug(f"[Vision] Post-action capture failed: {e}")
+
+    # ─── Camera Stream (Adaptive Rate) ─────────────────────────────────
 
     async def camera_loop(self):
-        """Periodically capture and send camera frames to AGiXT."""
+        """Periodically capture and send camera frames to AGiXT.
+        Uses adaptive rate: faster during movement, slower when idle."""
         if not self.camera_config.get("enabled", True):
             log.info("[Camera] Disabled in config")
             return
 
         await self._ready.wait()
-        interval = self.camera_config.get("interval", 3.0)
         quality = self.camera_config.get("quality", 70)
 
-        log.info(f"[Camera] Starting stream (interval={interval}s, q={quality})")
+        log.info(
+            f"[Camera] Starting adaptive stream "
+            f"(idle={self._camera_base_interval}s, "
+            f"moving={self._camera_moving_interval}s, q={quality})"
+        )
 
         while self._running:
             try:
                 jpeg_bytes, _ = await self.robot.capture_image()
                 if jpeg_bytes:
-                    # Re-encode at configured quality if from DDS (already JPEG)
-                    # For simulation frames, they're already encoded
                     b64 = base64.b64encode(jpeg_bytes).decode()
                     await self._ws.send(
                         json.dumps({"type": "image.input", "data": b64})
@@ -784,36 +1049,145 @@ class AGiXTVoiceClient:
             except Exception as e:
                 log.debug(f"[Camera] Frame error: {e}")
 
+            # Adaptive interval: fast when robot is moving, slow when idle
+            if self.robot._is_moving:
+                interval = self._camera_moving_interval
+            else:
+                interval = self._camera_base_interval
             await asyncio.sleep(interval)
 
-    # ─── Audio Capture (placeholder for DDS mic input) ──────────────────
+    # ─── Audio Capture with VAD ──────────────────────────────────────────
 
     async def audio_loop(self):
         """
-        Capture audio from the robot's microphone and send to AGiXT.
+        Capture audio from microphone with Voice Activity Detection (VAD).
 
-        Note: DDS audio capture from the Go2 microphone requires the
-        VUI client's audio stream, which may need additional SDK setup.
-        For initial testing, audio can also come from a USB mic on the Pi5.
+        Pipeline:
+        1. Read PCM chunks from microphone (via PyAudio)
+        2. Compute RMS energy for simple VAD
+        3. Buffer speech segments
+        4. On silence detection, encode as WAV and send to AGiXT
+        5. AGiXT transcribes via voice server and processes
         """
         if not self.audio_config.get("enabled", True):
             log.info("[Audio] Disabled in config")
             return
 
         await self._ready.wait()
-        log.info("[Audio] Audio capture ready (waiting for implementation)")
 
-        # TODO: Implement actual audio capture from Go2 mic or Pi5 USB mic
-        # The pipeline:
-        # 1. Capture PCM audio chunks from mic
-        # 2. Run simple VAD (RMS threshold)
-        # 3. Buffer speech segments
-        # 4. On silence detection, send accumulated audio as WAV to AGiXT
-        # 5. AGiXT transcribes via voice server and processes
+        if not self.robot._capture_stream:
+            log.warning(
+                "[Audio] No capture stream available — audio input disabled. "
+                "Install PyAudio and check microphone."
+            )
+            # Keep loop alive for future reconnect
+            while self._running:
+                await asyncio.sleep(5.0)
+            return
 
-        # Placeholder loop
+        sample_rate = self.audio_config.get("sample_rate", 16000)
+        chunk_duration = self.audio_config.get("chunk_duration", 0.5)
+        silence_threshold = self.audio_config.get("silence_threshold", 500)
+        silence_duration = self.audio_config.get("silence_duration", 1.5)
+        max_speech = self.audio_config.get("max_speech_duration", 30.0)
+
+        chunk_frames = int(sample_rate * chunk_duration)
+        loop = asyncio.get_event_loop()
+
+        log.info(
+            f"[Audio] Capture started (rate={sample_rate}Hz, "
+            f"vad_threshold={silence_threshold}, "
+            f"silence={silence_duration}s)"
+        )
+
+        speech_buffer = bytearray()
+        is_speaking = False
+        silence_start = 0.0
+        speech_start = 0.0
+
         while self._running:
-            await asyncio.sleep(1.0)
+            try:
+                # Read audio chunk (blocking → run in executor)
+                pcm_data = await loop.run_in_executor(
+                    None, self.robot.read_audio_chunk, chunk_frames
+                )
+                if not pcm_data:
+                    await asyncio.sleep(0.1)
+                    continue
+
+                # Don't capture while robot is speaking (echo suppression)
+                if self._playing_audio:
+                    continue
+
+                # Compute RMS energy for VAD
+                samples = np.frombuffer(pcm_data, dtype=np.int16)
+                rms = np.sqrt(np.mean(samples.astype(np.float32) ** 2))
+
+                now = time.time()
+
+                if rms >= silence_threshold:
+                    # Speech detected
+                    if not is_speaking:
+                        is_speaking = True
+                        speech_start = now
+                        speech_buffer.clear()
+                        log.debug(f"[Audio] Speech start (rms={rms:.0f})")
+                    silence_start = 0.0
+                    speech_buffer.extend(pcm_data)
+                else:
+                    # Silence
+                    if is_speaking:
+                        speech_buffer.extend(pcm_data)  # Include trailing silence
+                        if silence_start == 0.0:
+                            silence_start = now
+                        elif (now - silence_start) >= silence_duration:
+                            # End of speech — send to AGiXT
+                            duration = now - speech_start
+                            log.info(
+                                f"[Audio] Speech end ({duration:.1f}s, "
+                                f"{len(speech_buffer)} bytes)"
+                            )
+                            await self._send_speech_audio(
+                                bytes(speech_buffer), sample_rate
+                            )
+                            speech_buffer.clear()
+                            is_speaking = False
+                            silence_start = 0.0
+
+                # Force send if max speech duration exceeded
+                if is_speaking and (now - speech_start) >= max_speech:
+                    log.info(
+                        f"[Audio] Max speech duration ({max_speech}s) — sending"
+                    )
+                    await self._send_speech_audio(
+                        bytes(speech_buffer), sample_rate
+                    )
+                    speech_buffer.clear()
+                    is_speaking = False
+                    silence_start = 0.0
+
+            except Exception as e:
+                log.debug(f"[Audio] Capture error: {e}")
+                await asyncio.sleep(0.1)
+
+    async def _send_speech_audio(self, pcm_data: bytes, sample_rate: int):
+        """Encode PCM as WAV and send to AGiXT for transcription."""
+        if not self._ws or not self._running:
+            return
+
+        # Encode as WAV in memory
+        wav_buffer = io.BytesIO()
+        with wave.open(wav_buffer, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)  # 16-bit
+            wf.setframerate(sample_rate)
+            wf.writeframes(pcm_data)
+        wav_data = wav_buffer.getvalue()
+
+        # Send WAV as binary frame, then signal end
+        await self._ws.send(wav_data)
+        await self._ws.send(json.dumps({"type": "audio.input.end"}))
+        log.info(f"[Audio] Sent {len(wav_data)} bytes WAV to AGiXT")
 
     async def send_text(self, text: str):
         """Send a text message to AGiXT (for testing without audio)."""
@@ -831,6 +1205,7 @@ class AGiXTVoiceClient:
     async def stop(self):
         """Clean shutdown."""
         self._running = False
+        self._audio_interrupted = True
         if self._ws:
             try:
                 await self._ws.close()
@@ -892,6 +1267,7 @@ async def main(config: dict):
         pass
     finally:
         await client.stop()
+        robot.cleanup_audio()
         log.info("Go2 Control shutdown complete")
 
 
