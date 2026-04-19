@@ -32,6 +32,7 @@ from pathlib import Path
 import yaml
 import numpy as np
 import cv2
+import httpx
 import websockets
 
 try:
@@ -84,6 +85,27 @@ DEFAULT_CONFIG = {
         "input_device": None,  # None = system default, or device index
         "output_device": None,  # None = system default, or device index
     },
+    "wake_word": {
+        "enabled": True,
+        "word": "hey robot",  # wake word phrase
+        "server": "",  # voice server URL (auto-detected from VOICE_SERVER env)
+        "confidence_threshold": 0.5,  # minimum confidence to trigger
+        "listen_duration": 10.0,  # seconds to listen after wake word detected
+        "cooldown": 1.0,  # seconds after speech sent before listening for wake word again
+    },
+    "idle": {
+        "enabled": True,
+        "look_around_interval": 30.0,  # seconds between idle look-arounds
+        "animation_interval": 120.0,  # seconds between idle animations
+        "comment_interval": 180.0,  # seconds between idle comments on vision
+        "animations": [  # safe idle animations
+            "stretch",
+            "content",
+            "wiggle_hips",
+            "hello",
+            "heart",
+        ],
+    },
     "safety": {
         "max_vx": 1.0,  # m/s forward (conservative for voice control)
         "max_vy": 0.5,  # m/s lateral
@@ -116,6 +138,11 @@ def load_config(path: Optional[str] = None) -> dict:
             "1",
             "yes",
         )
+    # Auto-detect voice server for wake word
+    if not config["wake_word"].get("server"):
+        voice_server = os.environ.get("VOICE_SERVER", "")
+        if voice_server:
+            config["wake_word"]["server"] = voice_server
     return config
 
 
@@ -799,6 +826,8 @@ class AGiXTVoiceClient:
         self.agixt_config = config["agixt"]
         self.camera_config = config["camera"]
         self.audio_config = config["audio"]
+        self.wake_word_config = config.get("wake_word", {})
+        self.idle_config = config.get("idle", {})
 
         self._ws: Optional[websockets.WebSocketClientProtocol] = None
         self._running = False
@@ -815,6 +844,17 @@ class AGiXTVoiceClient:
         self._audio_interrupted = False
         self._audio_stop_time = 0.0  # time.time() when playback ended
         self._echo_tail_s = 0.15  # seconds to suppress mic after playback
+
+        # Wake word state
+        self._wake_word_active = False  # True = listening for speech to send
+        self._wake_word_until = 0.0  # time.time() when wake listening expires
+        self._wake_word_http: Optional[httpx.AsyncClient] = None
+
+        # Idle behavior state
+        self._last_idle_look = 0.0
+        self._last_idle_animation = 0.0
+        self._last_idle_comment = 0.0
+        self._idle_rng = __import__("random").Random()
 
         # Adaptive camera: faster rate during movement
         self._camera_base_interval = config["camera"].get("interval", 3.0)
@@ -1183,6 +1223,18 @@ class AGiXTVoiceClient:
         consecutive_read_errors = 0
         max_read_errors = 30  # ~15s at 0.5s chunks
 
+        # Wake word state
+        ww_enabled = self._wake_word_enabled()
+        ww_listen_duration = self.wake_word_config.get("listen_duration", 10.0)
+        ww_cooldown = self.wake_word_config.get("cooldown", 1.0)
+        if ww_enabled:
+            log.info(
+                f"[Audio] Wake word enabled: '{self.wake_word_config['word']}' "
+                f"(listen={ww_listen_duration}s)"
+            )
+        else:
+            log.info("[Audio] Wake word disabled — all speech sent to AGiXT")
+
         while self._running:
             try:
                 # Read audio chunk (blocking → run in executor)
@@ -1233,18 +1285,57 @@ class AGiXTVoiceClient:
                         if silence_start == 0.0:
                             silence_start = now
                         elif (now - silence_start) >= silence_duration:
-                            # End of speech — send to AGiXT
+                            # End of speech detected
                             duration = now - speech_start
-                            log.info(
-                                f"[Audio] Speech end ({duration:.1f}s, "
-                                f"{len(speech_buffer)} bytes)"
-                            )
-                            await self._send_speech_audio(
-                                bytes(speech_buffer), sample_rate
-                            )
+                            speech_bytes = bytes(speech_buffer)
                             speech_buffer.clear()
                             is_speaking = False
                             silence_start = 0.0
+
+                            # Wake word gating
+                            if ww_enabled and not self._wake_word_active:
+                                # Not in listen mode → check for wake word
+                                detected = await self._check_wake_word(
+                                    speech_bytes, sample_rate
+                                )
+                                if detected:
+                                    # Wake word found! Play a chirp/ack and
+                                    # open listen window
+                                    self._wake_word_active = True
+                                    self._wake_word_until = (
+                                        time.time() + ww_listen_duration
+                                    )
+                                    log.info(
+                                        f"[Audio] Wake word detected! "
+                                        f"Listening for {ww_listen_duration}s"
+                                    )
+                                    # Send a brief acknowledgment text
+                                    await self.send_text(
+                                        "[SYSTEM] Wake word detected. "
+                                        "The user is about to speak to you."
+                                    )
+                                else:
+                                    log.debug(
+                                        f"[Audio] Speech ignored "
+                                        f"({duration:.1f}s, no wake word)"
+                                    )
+                            else:
+                                # Either wake word disabled or in listen mode
+                                # → send to AGiXT
+                                log.info(
+                                    f"[Audio] Speech end ({duration:.1f}s, "
+                                    f"{len(speech_bytes)} bytes)"
+                                )
+                                await self._send_speech_audio(
+                                    speech_bytes, sample_rate
+                                )
+                                # Extend listen window on each utterance
+                                if self._wake_word_active:
+                                    self._wake_word_until = (
+                                        time.time() + ww_listen_duration
+                                    )
+                                    # Brief cooldown before next VAD trigger
+                                    await asyncio.sleep(ww_cooldown)
 
                 # Force send if max speech duration or buffer size exceeded
                 if is_speaking and (
@@ -1263,6 +1354,11 @@ class AGiXTVoiceClient:
                     speech_buffer.clear()
                     is_speaking = False
                     silence_start = 0.0
+
+                # Check if wake word listen window has expired
+                if self._wake_word_active and time.time() > self._wake_word_until:
+                    self._wake_word_active = False
+                    log.info("[Audio] Wake word listen window expired")
 
             except Exception as e:
                 log.debug(f"[Audio] Capture error: {e}")
@@ -1300,10 +1396,166 @@ class AGiXTVoiceClient:
             await self._ws.send(json.dumps({"type": "audio.input.end"}))
             log.info(f"[Send] Audio: {len(wav_data)} bytes")
 
+    # ─── Wake Word Detection ─────────────────────────────────────────────
+
+    async def _check_wake_word(self, pcm_data: bytes, sample_rate: int) -> bool:
+        """Check if audio contains the wake word via voice server API.
+
+        Returns True if wake word detected with sufficient confidence.
+        """
+        ww_cfg = self.wake_word_config
+        server = ww_cfg.get("server", "")
+        word = ww_cfg.get("word", "hey robot")
+        threshold = ww_cfg.get("confidence_threshold", 0.5)
+
+        if not server:
+            return True  # No server configured → pass through all audio
+
+        # Encode PCM as WAV for the API
+        wav_buffer = io.BytesIO()
+        with wave.open(wav_buffer, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(sample_rate)
+            wf.writeframes(pcm_data)
+        audio_b64 = base64.b64encode(wav_buffer.getvalue()).decode()
+
+        # URL-safe word encoding
+        word_slug = word.replace(" ", "%20")
+        url = f"{server.rstrip('/')}/v1/wakeword/predict/{word_slug}"
+
+        try:
+            if self._wake_word_http is None or self._wake_word_http.is_closed:
+                self._wake_word_http = httpx.AsyncClient(timeout=5.0)
+            resp = await self._wake_word_http.post(
+                url, json={"audio_base64": audio_b64}
+            )
+            resp.raise_for_status()
+            result = resp.json()
+            detected = result.get("detected", False)
+            confidence = result.get("confidence", 0.0)
+            if detected and confidence >= threshold:
+                log.info(
+                    f"[WakeWord] Detected '{word}' "
+                    f"(confidence={confidence:.2f})"
+                )
+                return True
+            return False
+        except Exception as e:
+            log.debug(f"[WakeWord] Check failed: {e}")
+            # On error, fail open — let audio through so user isn't locked out
+            return True
+
+    def _wake_word_enabled(self) -> bool:
+        """Check if wake word gating is enabled and configured."""
+        ww_cfg = self.wake_word_config
+        return (
+            ww_cfg.get("enabled", False)
+            and bool(ww_cfg.get("server", ""))
+            and bool(ww_cfg.get("word", ""))
+        )
+
+    # ─── Idle Personality Behavior ───────────────────────────────────────
+
+    async def idle_loop(self):
+        """
+        Periodic autonomous idle behaviors to make the robot feel alive.
+
+        - Look around (random euler adjustments) every ~30s
+        - perform idle animations (stretch, wiggle, etc.) every ~120s
+        - Occasionally comment on what it sees via text to AGiXT every ~180s
+        """
+        if not self.idle_config.get("enabled", False):
+            log.info("[Idle] Disabled in config")
+            return
+
+        await self._ready.wait()
+
+        look_interval = self.idle_config.get("look_around_interval", 30.0)
+        anim_interval = self.idle_config.get("animation_interval", 120.0)
+        comment_interval = self.idle_config.get("comment_interval", 180.0)
+        animations = self.idle_config.get(
+            "animations", ["stretch", "content", "wiggle_hips"]
+        )
+
+        now = time.time()
+        self._last_idle_look = now
+        self._last_idle_animation = now + 30  # Delay first animation
+        self._last_idle_comment = now + 60  # Delay first comment
+
+        log.info(
+            f"[Idle] Personality active (look={look_interval}s, "
+            f"anim={anim_interval}s, comment={comment_interval}s)"
+        )
+
+        while self._running:
+            await asyncio.sleep(5.0)  # Check every 5s
+
+            # Don't do idle things while busy
+            if (
+                self.robot._is_moving
+                or self._playing_audio
+                or self._wake_word_active
+            ):
+                continue
+
+            now = time.time()
+
+            # Look around — subtle random head movements
+            if now - self._last_idle_look >= look_interval:
+                self._last_idle_look = now
+                try:
+                    roll = self._idle_rng.uniform(-0.15, 0.15)
+                    pitch = self._idle_rng.uniform(-0.2, 0.2)
+                    yaw = self._idle_rng.uniform(-0.3, 0.3)
+                    await self.robot.set_body_euler(roll, pitch, yaw)
+                    log.debug(
+                        f"[Idle] Look around: r={roll:.2f} p={pitch:.2f} y={yaw:.2f}"
+                    )
+                    # Pause then return to neutral
+                    await asyncio.sleep(3.0)
+                    await self.robot.set_body_euler(0, 0, 0)
+                except Exception as e:
+                    log.debug(f"[Idle] Look failed: {e}")
+
+            # Idle animation — fun little movements
+            if now - self._last_idle_animation >= anim_interval:
+                self._last_idle_animation = now
+                if animations:
+                    action = self._idle_rng.choice(animations)
+                    try:
+                        log.info(f"[Idle] Animation: {action}")
+                        await self.robot.execute_action(action)
+                    except Exception as e:
+                        log.debug(f"[Idle] Animation failed: {e}")
+
+            # Comment on what it sees — tell AGiXT to describe the view
+            if now - self._last_idle_comment >= comment_interval:
+                self._last_idle_comment = now
+                try:
+                    prompts = [
+                        "Look around and briefly describe what you see. "
+                        "Just a casual observation, one sentence.",
+                        "What's interesting in your view right now? "
+                        "Share a quick thought.",
+                        "Take a look around. Any observations about "
+                        "your surroundings?",
+                    ]
+                    prompt = self._idle_rng.choice(prompts)
+                    await self.send_text(prompt)
+                    log.info("[Idle] Sent vision comment prompt")
+                except Exception as e:
+                    log.debug(f"[Idle] Comment failed: {e}")
+
     async def stop(self):
         """Clean shutdown."""
         self._running = False
         self._audio_interrupted = True
+        if self._wake_word_http and not self._wake_word_http.is_closed:
+            try:
+                await self._wake_word_http.aclose()
+            except Exception:
+                pass
         if self._ws:
             try:
                 await self._ws.close()
@@ -1346,6 +1598,15 @@ async def main(config: dict):
     log.info(f"  AGiXT: {config['agixt']['server']}")
     log.info("  Camera streaming: " + ("ON" if config["camera"]["enabled"] else "OFF"))
     log.info("  Audio capture: " + ("ON" if config["audio"]["enabled"] else "OFF"))
+    ww_cfg = config.get("wake_word", {})
+    if ww_cfg.get("enabled") and ww_cfg.get("server"):
+        log.info(f"  Wake word: '{ww_cfg['word']}'")
+    else:
+        log.info("  Wake word: OFF (all speech sent)")
+    log.info(
+        "  Idle personality: "
+        + ("ON" if config.get("idle", {}).get("enabled") else "OFF")
+    )
     log.info("=" * 50)
 
     # Run all loops concurrently
@@ -1353,6 +1614,7 @@ async def main(config: dict):
         asyncio.ensure_future(client.run()),  # Main WS message handler
         asyncio.ensure_future(client.camera_loop()),  # Camera frame sender
         asyncio.ensure_future(client.audio_loop()),  # Audio capture
+        asyncio.ensure_future(client.idle_loop()),  # Idle personality
     ]
 
     # Also start an interactive text input loop for testing
@@ -1362,7 +1624,7 @@ async def main(config: dict):
     try:
         results = await asyncio.gather(*tasks, return_exceptions=True)
         # Report any task failures
-        task_names = ["message_handler", "camera_loop", "audio_loop"]
+        task_names = ["message_handler", "camera_loop", "audio_loop", "idle_loop"]
         if sys.stdin.isatty():
             task_names.append("interactive_input")
         for name, result in zip(task_names, results):
