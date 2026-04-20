@@ -1,7 +1,7 @@
 """
 Go2 Control — AGiXT Voice Conversation Client for Unitree Go2 Pro
 
-Runs on a Raspberry Pi 5 connected to the Go2 via Ethernet/WiFi.
+Runs on a Raspberry Pi 4B/5 connected to the Go2 via Ethernet/WiFi.
 Connects to AGiXT's voice conversation WebSocket and bridges:
   - Robot camera → AGiXT vision (periodic JPEG frames)
   - Robot microphone → AGiXT STT (VAD-triggered audio chunks)
@@ -436,7 +436,7 @@ class Go2Robot:
 
             interface = self.robot_config.get("interface", "eth0")
             log.info(f"[Robot] Initializing DDS on interface: {interface}")
-            ChannelFactoryInitialize(domain_id=0, interface=interface)
+            ChannelFactoryInitialize(id=0, networkInterface=interface)
 
             self._sport_client = SportClient()
             self._sport_client.SetTimeout(10.0)

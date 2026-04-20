@@ -280,8 +280,8 @@ class RobotConnection:
             from unitree_sdk2py.go2.vui.vui_client import VuiClient
 
             ChannelFactoryInitialize(
-                self.config.connection.dds_domain_id,
-                self.config.connection.dds_interface,
+                id=self.config.connection.dds_domain_id,
+                networkInterface=self.config.connection.dds_interface,
             )
 
             self._sport_client = SportClient()
