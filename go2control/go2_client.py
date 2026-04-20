@@ -1392,12 +1392,18 @@ class AGiXTVoiceClient:
                                     # If user said more after the wake word
                                     # (e.g. "hey robot what time is it"),
                                     # send the trailing text as their command
+                                    # and close the listen window so the same
+                                    # audio doesn't get sent again as speech.
                                     if trailing and len(trailing) > 2:
                                         log.info(
                                             f"[Audio] Sending trailing "
                                             f"text: '{trailing}'"
                                         )
                                         await self.send_text(trailing)
+                                        # Close listen window — command already
+                                        # sent, don't capture echo/residual
+                                        self._wake_word_active = False
+                                        self._wake_word_until = 0
                                 else:
                                     log.info(
                                         f"[Audio] Speech ignored "
