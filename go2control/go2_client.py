@@ -1372,8 +1372,10 @@ class AGiXTVoiceClient:
                             # Wake word gating
                             if ww_enabled and not self._wake_word_active:
                                 # Not in listen mode → check for wake word
-                                detected = await self._check_wake_word(
-                                    speech_bytes, sample_rate
+                                detected, trailing = (
+                                    await self._check_wake_word(
+                                        speech_bytes, sample_rate
+                                    )
                                 )
                                 if detected:
                                     # Wake word found! Play chime and open
@@ -1388,12 +1390,18 @@ class AGiXTVoiceClient:
                                     )
                                     # Play chime so user knows we heard them
                                     loop = asyncio.get_event_loop()
-                                    await loop.run_in_executor(None, self._play_chime)
-                                    # Send a brief acknowledgment text
-                                    await self.send_text(
-                                        "[SYSTEM] Wake word detected. "
-                                        "The user is about to speak to you."
+                                    await loop.run_in_executor(
+                                        None, self._play_chime
                                     )
+                                    # If user said more after the wake word
+                                    # (e.g. "hey robot what time is it"),
+                                    # send the trailing text as their command
+                                    if trailing and len(trailing) > 2:
+                                        log.info(
+                                            f"[Audio] Sending trailing "
+                                            f"text: '{trailing}'"
+                                        )
+                                        await self.send_text(trailing)
                                 else:
                                     log.info(
                                         f"[Audio] Speech ignored "
@@ -1541,7 +1549,9 @@ class AGiXTVoiceClient:
 
     # ─── Wake Word Detection ─────────────────────────────────────────────
 
-    async def _check_wake_word(self, pcm_data: bytes, sample_rate: int) -> bool:
+    async def _check_wake_word(
+        self, pcm_data: bytes, sample_rate: int
+    ) -> tuple:
         """Check if audio contains the wake word using STT transcription.
 
         Uses the voice server's transcription endpoint to convert speech to text,
@@ -1549,7 +1559,9 @@ class AGiXTVoiceClient:
         more reliable than the dedicated wake word model which has high false
         positive rates with boosted Bluetooth microphone gain.
 
-        Returns True if wake word detected in transcript.
+        Returns (detected: bool, trailing_text: str) where trailing_text is
+        any speech that came after the wake word in the same utterance.
+        e.g. "hey robot what time is it" -> (True, "what time is it")
         """
         ww_cfg = self.wake_word_config
         server = ww_cfg.get("server", "")
@@ -1585,7 +1597,7 @@ class AGiXTVoiceClient:
 
             if not transcript:
                 log.info("[WakeWord] Empty transcript — no speech detected")
-                return False
+                return False, ""
 
             # Check if wake word appears in the transcript
             # Allow fuzzy matching: "hey robot" matches "hey robot", "hey, robot",
@@ -1594,16 +1606,26 @@ class AGiXTVoiceClient:
             all_found = all(part in transcript for part in word_parts)
 
             if all_found:
+                # Extract text after the wake word
+                # Find the last wake word part and take everything after it
+                trailing = transcript
+                for part in word_parts:
+                    idx = trailing.find(part)
+                    if idx >= 0:
+                        trailing = trailing[idx + len(part) :]
+                trailing = trailing.strip().strip(".,!?;:")
                 log.info(
-                    f"[WakeWord] Detected '{word}' in transcript: " f"'{transcript}'"
+                    f"[WakeWord] Detected '{word}' in transcript: "
+                    f"'{transcript}'"
+                    + (f" (trailing: '{trailing}')" if trailing else "")
                 )
-                return True
+                return True, trailing
             else:
                 log.info(f"[WakeWord] No match — heard: '{transcript}'")
-                return False
+                return False, ""
         except Exception as e:
             log.warning(f"[WakeWord] STT check failed: {e}")
-            return False
+            return False, ""
 
     def _wake_word_enabled(self) -> bool:
         """Check if wake word gating is enabled and configured."""
