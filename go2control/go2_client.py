@@ -1372,10 +1372,8 @@ class AGiXTVoiceClient:
                             # Wake word gating
                             if ww_enabled and not self._wake_word_active:
                                 # Not in listen mode → check for wake word
-                                detected, trailing = (
-                                    await self._check_wake_word(
-                                        speech_bytes, sample_rate
-                                    )
+                                detected, trailing = await self._check_wake_word(
+                                    speech_bytes, sample_rate
                                 )
                                 if detected:
                                     # Wake word found! Play chime and open
@@ -1390,9 +1388,7 @@ class AGiXTVoiceClient:
                                     )
                                     # Play chime so user knows we heard them
                                     loop = asyncio.get_event_loop()
-                                    await loop.run_in_executor(
-                                        None, self._play_chime
-                                    )
+                                    await loop.run_in_executor(None, self._play_chime)
                                     # If user said more after the wake word
                                     # (e.g. "hey robot what time is it"),
                                     # send the trailing text as their command
@@ -1549,9 +1545,7 @@ class AGiXTVoiceClient:
 
     # ─── Wake Word Detection ─────────────────────────────────────────────
 
-    async def _check_wake_word(
-        self, pcm_data: bytes, sample_rate: int
-    ) -> tuple:
+    async def _check_wake_word(self, pcm_data: bytes, sample_rate: int) -> tuple:
         """Check if audio contains the wake word using STT transcription.
 
         Uses the voice server's transcription endpoint to convert speech to text,
