@@ -474,7 +474,7 @@ class Go2Robot:
 
     def _init_audio(self):
         """Initialize PyAudio for playback and capture.
-        
+
         Streams are opened independently so a capture failure doesn't
         prevent playback (and vice versa).
         """
@@ -741,7 +741,12 @@ class Go2Robot:
             # Update posture based on action
             if action_name in ("sit", "stand_down"):
                 self._current_posture = "sitting"
-            elif action_name in ("stand_up", "recovery_stand", "rise_sit", "balance_stand"):
+            elif action_name in (
+                "stand_up",
+                "recovery_stand",
+                "rise_sit",
+                "balance_stand",
+            ):
                 self._current_posture = "standing"
             await asyncio.sleep(1.0)
             return f"Action '{action_name}' executed (simulation)"
@@ -937,11 +942,13 @@ class AGiXTVoiceClient:
 
         # Register robot tools with identity context
         await self._ws.send(
-            json.dumps({
-                "type": "tools.register",
-                "tools": ROBOT_TOOLS,
-                "identity": ROBOT_IDENTITY,
-            })
+            json.dumps(
+                {
+                    "type": "tools.register",
+                    "tools": ROBOT_TOOLS,
+                    "identity": ROBOT_IDENTITY,
+                }
+            )
         )
         log.info(f"[AGiXT] Registered {len(ROBOT_TOOLS)} robot tools with identity")
 
@@ -1158,9 +1165,7 @@ class AGiXTVoiceClient:
             jpeg_bytes, _ = await self.robot.capture_image()
             if jpeg_bytes:
                 b64 = base64.b64encode(jpeg_bytes).decode()
-                await self._ws.send(
-                    json.dumps({"type": "image.input", "data": b64})
-                )
+                await self._ws.send(json.dumps({"type": "image.input", "data": b64}))
                 log.debug("[Vision] Post-action frame sent")
         except Exception as e:
             log.debug(f"[Vision] Post-action capture failed: {e}")
@@ -1270,7 +1275,9 @@ class AGiXTVoiceClient:
         loop = asyncio.get_event_loop()
         max_buffer_bytes = 5 * 1024 * 1024  # 5MB hard limit on speech buffer
 
-        rate_info = f"{native_rate}Hz→{sample_rate}Hz" if needs_resample else f"{sample_rate}Hz"
+        rate_info = (
+            f"{native_rate}Hz→{sample_rate}Hz" if needs_resample else f"{sample_rate}Hz"
+        )
         log.info(
             f"[Audio] Capture started (rate={rate_info}, "
             f"vad_threshold={silence_threshold}, "
@@ -1328,7 +1335,9 @@ class AGiXTVoiceClient:
                 if needs_resample:
                     samples_native = np.frombuffer(pcm_data, dtype=np.int16)
                     num_target = int(len(samples_native) * sample_rate / native_rate)
-                    indices = np.linspace(0, len(samples_native) - 1, num_target).astype(int)
+                    indices = np.linspace(
+                        0, len(samples_native) - 1, num_target
+                    ).astype(int)
                     pcm_data = samples_native[indices].astype(np.int16).tobytes()
 
                 # Compute RMS energy for VAD
@@ -1379,9 +1388,7 @@ class AGiXTVoiceClient:
                                     )
                                     # Play chime so user knows we heard them
                                     loop = asyncio.get_event_loop()
-                                    await loop.run_in_executor(
-                                        None, self._play_chime
-                                    )
+                                    await loop.run_in_executor(None, self._play_chime)
                                     # Send a brief acknowledgment text
                                     await self.send_text(
                                         "[SYSTEM] Wake word detected. "
@@ -1399,9 +1406,7 @@ class AGiXTVoiceClient:
                                     f"[Audio] Speech end ({duration:.1f}s, "
                                     f"{len(speech_bytes)} bytes)"
                                 )
-                                await self._send_speech_audio(
-                                    speech_bytes, sample_rate
-                                )
+                                await self._send_speech_audio(speech_bytes, sample_rate)
                                 # Extend listen window on each utterance
                                 if self._wake_word_active:
                                     self._wake_word_until = (
@@ -1425,9 +1430,7 @@ class AGiXTVoiceClient:
                     if ww_enabled and not self._wake_word_active:
                         log.debug("[Audio] Force-send suppressed — no wake word")
                     else:
-                        await self._send_speech_audio(
-                            bytes(speech_buffer), sample_rate
-                        )
+                        await self._send_speech_audio(bytes(speech_buffer), sample_rate)
                     speech_buffer.clear()
                     is_speaking = False
                     silence_start = 0.0
@@ -1592,14 +1595,11 @@ class AGiXTVoiceClient:
 
             if all_found:
                 log.info(
-                    f"[WakeWord] Detected '{word}' in transcript: "
-                    f"'{transcript}'"
+                    f"[WakeWord] Detected '{word}' in transcript: " f"'{transcript}'"
                 )
                 return True
             else:
-                log.info(
-                    f"[WakeWord] No match — heard: '{transcript}'"
-                )
+                log.info(f"[WakeWord] No match — heard: '{transcript}'")
                 return False
         except Exception as e:
             log.warning(f"[WakeWord] STT check failed: {e}")
@@ -1651,11 +1651,7 @@ class AGiXTVoiceClient:
             await asyncio.sleep(5.0)  # Check every 5s
 
             # Don't do idle things while busy
-            if (
-                self.robot._is_moving
-                or self._playing_audio
-                or self._wake_word_active
-            ):
+            if self.robot._is_moving or self._playing_audio or self._wake_word_active:
                 continue
 
             now = time.time()
