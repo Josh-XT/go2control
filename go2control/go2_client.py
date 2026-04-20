@@ -564,6 +564,23 @@ class Go2Robot:
             except Exception as e:
                 log.debug(f"[Audio] Playback error: {e}")
 
+    def play_audio_buffer(self, pcm_data: bytes, block_size: int = 16384):
+        """Play a large PCM buffer through the speaker in blocks.
+
+        Writes in block_size chunks to keep the audio stream fed
+        without overwhelming the Bluetooth codec.
+        """
+        if not self._playback_stream or not pcm_data:
+            return
+        try:
+            offset = 0
+            while offset < len(pcm_data):
+                end = min(offset + block_size, len(pcm_data))
+                self._playback_stream.write(pcm_data[offset:end])
+                offset = end
+        except Exception as e:
+            log.debug(f"[Audio] Playback error: {e}")
+
     def stop_playback(self):
         """Stop any in-progress audio playback by flushing the buffer."""
         if self._playback_stream:
@@ -865,6 +882,7 @@ class AGiXTVoiceClient:
         self._audio_interrupted = False
         self._audio_stop_time = 0.0  # time.time() when playback ended
         self._echo_tail_s = 0.15  # seconds to suppress mic after playback
+        self._playback_buffer = bytearray()  # buffer for smooth BT playback
 
         # Wake word state
         self._wake_word_active = False  # True = listening for speech to send
@@ -943,14 +961,19 @@ class AGiXTVoiceClient:
                         break
 
                     if isinstance(message, bytes):
-                        # TTS audio from AGiXT — play through robot speaker
+                        # TTS audio from AGiXT — buffer for smooth playback
                         if self._audio_interrupted:
                             continue  # Discard audio chunks after interrupt
                         self._playing_audio = True
-                        loop = asyncio.get_event_loop()
-                        await loop.run_in_executor(
-                            None, self.robot.play_audio_chunk, message
-                        )
+                        self._playback_buffer.extend(message)
+                        # Write when we have enough buffered (~340ms at 24kHz)
+                        if len(self._playback_buffer) >= 16384:
+                            chunk = bytes(self._playback_buffer)
+                            self._playback_buffer.clear()
+                            loop = asyncio.get_event_loop()
+                            await loop.run_in_executor(
+                                None, self.robot.play_audio_buffer, chunk
+                            )
                         continue
 
                     try:
@@ -987,9 +1010,18 @@ class AGiXTVoiceClient:
                         # New audio stream starting — reset interrupt flag
                         self._audio_interrupted = False
                         self._playing_audio = True
+                        self._playback_buffer.clear()
                         log.debug(f"[AGiXT] Audio header: {data.get('data', {})}")
 
                     elif msg_type == "audio.end":
+                        # Flush remaining buffered audio
+                        if self._playback_buffer:
+                            chunk = bytes(self._playback_buffer)
+                            self._playback_buffer.clear()
+                            loop = asyncio.get_event_loop()
+                            await loop.run_in_executor(
+                                None, self.robot.play_audio_buffer, chunk
+                            )
                         self._playing_audio = False
                         self._audio_stop_time = time.time()
                         log.debug("[AGiXT] Audio stream ended")
@@ -998,6 +1030,7 @@ class AGiXTVoiceClient:
                         # Stop playback immediately
                         self._audio_interrupted = True
                         self._playing_audio = False
+                        self._playback_buffer.clear()
                         self._audio_stop_time = time.time()
                         loop = asyncio.get_event_loop()
                         await loop.run_in_executor(None, self.robot.stop_playback)
