@@ -881,7 +881,7 @@ class AGiXTVoiceClient:
         self._playing_audio = False
         self._audio_interrupted = False
         self._audio_stop_time = 0.0  # time.time() when playback ended
-        self._echo_tail_s = 0.15  # seconds to suppress mic after playback
+        self._echo_tail_s = 1.5  # seconds to suppress mic after playback (BT latency)
         self._playback_buffer = bytearray()  # buffer for smooth BT playback
 
         # Wake word state
@@ -1367,8 +1367,8 @@ class AGiXTVoiceClient:
                                     speech_bytes, sample_rate
                                 )
                                 if detected:
-                                    # Wake word found! Play a chirp/ack and
-                                    # open listen window
+                                    # Wake word found! Play chime and open
+                                    # listen window
                                     self._wake_word_active = True
                                     self._wake_word_until = (
                                         time.time() + ww_listen_duration
@@ -1377,13 +1377,18 @@ class AGiXTVoiceClient:
                                         f"[Audio] Wake word detected! "
                                         f"Listening for {ww_listen_duration}s"
                                     )
+                                    # Play chime so user knows we heard them
+                                    loop = asyncio.get_event_loop()
+                                    await loop.run_in_executor(
+                                        None, self._play_chime
+                                    )
                                     # Send a brief acknowledgment text
                                     await self.send_text(
                                         "[SYSTEM] Wake word detected. "
                                         "The user is about to speak to you."
                                     )
                                 else:
-                                    log.debug(
+                                    log.info(
                                         f"[Audio] Speech ignored "
                                         f"({duration:.1f}s, no wake word)"
                                     )
@@ -1440,10 +1445,39 @@ class AGiXTVoiceClient:
                 log.debug(f"[Audio] Capture error: {e}")
                 await asyncio.sleep(0.1)
 
+    @staticmethod
+    def _normalize_pcm(pcm_data: bytes, target_peak: float = 0.8) -> bytes:
+        """Normalize 16-bit PCM audio to use more dynamic range.
+
+        Mirrors the ESP32's audio preprocessing pipeline:
+        1. Remove DC offset (BT HFP mSBC mics have significant DC bias)
+        2. Normalize peak amplitude to target_peak of full scale
+
+        BT HFP mic audio is very quiet (~6% of full scale), which causes
+        Whisper STT to return empty transcripts.
+        """
+        samples = np.frombuffer(pcm_data, dtype=np.int16).astype(np.float32)
+        if len(samples) == 0:
+            return pcm_data
+        # Step 1: Remove DC offset (mean bias) — critical for BT mics
+        dc_offset = np.mean(samples)
+        samples = samples - dc_offset
+        # Step 2: Normalize to target peak
+        peak = np.max(np.abs(samples))
+        if peak < 1:
+            return pcm_data
+        gain = (32768 * target_peak) / peak
+        if gain <= 1.0:
+            return pcm_data  # Already loud enough
+        normalized = np.clip(samples * gain, -32768, 32767).astype(np.int16)
+        return normalized.tobytes()
+
     async def _send_speech_audio(self, pcm_data: bytes, sample_rate: int):
         """Encode PCM as WAV and send to AGiXT for transcription."""
         if not self._ws or not self._running:
             return
+
+        pcm_data = self._normalize_pcm(pcm_data)
 
         # Encode as WAV in memory
         wav_buffer = io.BytesIO()
@@ -1475,55 +1509,101 @@ class AGiXTVoiceClient:
                 await self._ws.send(json.dumps({"type": "audio.input.end"}))
             log.info(f"[Send] Audio: {len(wav_data)} bytes")
 
+    # ─── Wake Word Chime ────────────────────────────────────────────────
+
+    def _play_chime(self):
+        """Play a short two-tone chime to acknowledge wake word detection.
+
+        Generates a pleasant ascending two-note chime (C5 → E5) using
+        numpy and plays it through the existing playback stream at 24kHz.
+        """
+        if not self.robot._playback_stream:
+            return
+        try:
+            rate = 24000
+            # Two short tones: C5 (523Hz) for 80ms, E5 (659Hz) for 120ms
+            t1 = np.linspace(0, 0.08, int(rate * 0.08), endpoint=False)
+            t2 = np.linspace(0, 0.12, int(rate * 0.12), endpoint=False)
+            # Apply envelope (fade in/out) to avoid clicks
+            env1 = np.minimum(t1 / 0.01, 1.0) * np.minimum((0.08 - t1) / 0.01, 1.0)
+            env2 = np.minimum(t2 / 0.01, 1.0) * np.minimum((0.12 - t2) / 0.01, 1.0)
+            tone1 = (np.sin(2 * np.pi * 523 * t1) * env1 * 12000).astype(np.int16)
+            tone2 = (np.sin(2 * np.pi * 659 * t2) * env2 * 12000).astype(np.int16)
+            # 20ms silence gap between notes
+            gap = np.zeros(int(rate * 0.02), dtype=np.int16)
+            chime = np.concatenate([tone1, gap, tone2])
+            self.robot.play_audio_buffer(chime.tobytes())
+        except Exception as e:
+            log.debug(f"[Audio] Chime playback error: {e}")
+
     # ─── Wake Word Detection ─────────────────────────────────────────────
 
     async def _check_wake_word(self, pcm_data: bytes, sample_rate: int) -> bool:
-        """Check if audio contains the wake word via voice server API.
+        """Check if audio contains the wake word using STT transcription.
 
-        Returns True if wake word detected with sufficient confidence.
+        Uses the voice server's transcription endpoint to convert speech to text,
+        then checks if the wake word phrase appears in the transcript. This is
+        more reliable than the dedicated wake word model which has high false
+        positive rates with boosted Bluetooth microphone gain.
+
+        Returns True if wake word detected in transcript.
         """
         ww_cfg = self.wake_word_config
         server = ww_cfg.get("server", "")
-        word = ww_cfg.get("word", "hey robot")
-        threshold = ww_cfg.get("confidence_threshold", 0.5)
+        word = ww_cfg.get("word", "hey robot").lower().strip()
 
         if not server:
             return True  # No server configured → pass through all audio
 
-        # Encode PCM as WAV for the API
+        pcm_data = self._normalize_pcm(pcm_data)
+
+        # Encode PCM as WAV for the STT API
         wav_buffer = io.BytesIO()
         with wave.open(wav_buffer, "wb") as wf:
             wf.setnchannels(1)
             wf.setsampwidth(2)
             wf.setframerate(sample_rate)
             wf.writeframes(pcm_data)
-        audio_b64 = base64.b64encode(wav_buffer.getvalue()).decode()
+        wav_bytes = wav_buffer.getvalue()
 
-        # URL-safe word encoding
-        word_slug = __import__("urllib.parse", fromlist=["quote"]).quote(word, safe="")
-        url = f"{server.rstrip('/')}/v1/wakeword/predict/{word_slug}"
+        url = f"{server.rstrip('/')}/v1/audio/transcriptions"
 
         try:
             if self._wake_word_http is None or self._wake_word_http.is_closed:
-                self._wake_word_http = httpx.AsyncClient(timeout=5.0)
-            resp = await self._wake_word_http.post(
-                url, json={"audio_base64": audio_b64}
-            )
+                self._wake_word_http = httpx.AsyncClient(timeout=10.0)
+
+            # Send as multipart form data (same format AGiXT uses for STT)
+            files = {"file": ("audio.wav", wav_bytes, "audio/wav")}
+            data = {"model": "base", "language": "en"}
+            resp = await self._wake_word_http.post(url, files=files, data=data)
             resp.raise_for_status()
             result = resp.json()
-            detected = result.get("detected", False)
-            confidence = result.get("confidence", 0.0)
-            if detected and confidence >= threshold:
+            transcript = result.get("text", "").lower().strip()
+
+            if not transcript:
+                log.info("[WakeWord] Empty transcript — no speech detected")
+                return False
+
+            # Check if wake word appears in the transcript
+            # Allow fuzzy matching: "hey robot" matches "hey robot", "hey, robot",
+            # "hey robots", etc.
+            word_parts = word.split()
+            all_found = all(part in transcript for part in word_parts)
+
+            if all_found:
                 log.info(
-                    f"[WakeWord] Detected '{word}' "
-                    f"(confidence={confidence:.2f})"
+                    f"[WakeWord] Detected '{word}' in transcript: "
+                    f"'{transcript}'"
                 )
                 return True
-            return False
+            else:
+                log.info(
+                    f"[WakeWord] No match — heard: '{transcript}'"
+                )
+                return False
         except Exception as e:
-            log.debug(f"[WakeWord] Check failed: {e}")
-            # On error, fail open — let audio through so user isn't locked out
-            return True
+            log.warning(f"[WakeWord] STT check failed: {e}")
+            return False
 
     def _wake_word_enabled(self) -> bool:
         """Check if wake word gating is enabled and configured."""
@@ -1650,16 +1730,15 @@ async def main(config: dict):
 
     # Initialize robot
     robot = Go2Robot(config)
+    robot_connected = False
     try:
         await robot.connect()
+        robot_connected = True
     except Exception as e:
-        log.error(f"Failed to connect to robot: {e}")
-        if not config.get("simulation"):
-            log.info(
-                "Tip: Set simulation=true in config or GO2_SIMULATION=true to test without robot"
-            )
-            return
-        raise
+        log.warning(f"[Robot] Connection failed: {e}")
+        log.info("[Robot] Continuing without robot — voice/audio still active")
+        # Ensure audio is initialized even without robot DDS
+        robot._init_audio()
 
     # Initialize AGiXT client
     client = AGiXTVoiceClient(config, robot)
@@ -1669,11 +1748,20 @@ async def main(config: dict):
         log.error(f"Failed to connect to AGiXT: {e}")
         return
 
+    robot_status = "Connected"
+    if not robot_connected:
+        robot_status = "OFFLINE (voice-only mode)"
+    elif config.get("simulation"):
+        robot_status = "Connected (simulation)"
+
+    # Disable camera and idle when robot is offline
+    if not robot_connected:
+        config["camera"]["enabled"] = False
+        config.setdefault("idle", {})["enabled"] = False
+
     log.info("=" * 50)
     log.info("Go2 Control is running!")
-    log.info(
-        "  Robot: Connected" + (" (simulation)" if config.get("simulation") else "")
-    )
+    log.info(f"  Robot: {robot_status}")
     log.info(f"  AGiXT: {config['agixt']['server']}")
     log.info("  Camera streaming: " + ("ON" if config["camera"]["enabled"] else "OFF"))
     log.info("  Audio capture: " + ("ON" if config["audio"]["enabled"] else "OFF"))
