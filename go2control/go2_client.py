@@ -400,6 +400,7 @@ class Go2Robot:
         self._pa: Optional[object] = None
         self._playback_stream: Optional[object] = None
         self._capture_stream: Optional[object] = None
+        self._capture_native_rate: int = 16000  # actual hardware capture rate
 
         # State tracking
         self._is_moving = False
@@ -509,7 +510,7 @@ class Go2Robot:
             log.error(f"[Audio] Playback stream failed: {e}")
             self._playback_stream = None
 
-        # Open capture stream (16kHz 16-bit mono for Whisper STT)
+        # Open capture stream (prefer 16kHz for Whisper, fallback to 48kHz)
         capture_rate = audio_cfg.get("sample_rate", 16000)
         input_dev = audio_cfg.get("input_device", None)
         try:
@@ -521,9 +522,29 @@ class Go2Robot:
                 input_device_index=input_dev,
                 frames_per_buffer=1024,
             )
+            self._capture_native_rate = capture_rate
         except Exception as e:
-            log.error(f"[Audio] Capture stream failed: {e}")
-            self._capture_stream = None
+            log.warning(
+                f"[Audio] Capture at {capture_rate}Hz failed, "
+                f"trying 48000Hz with resampling: {e}"
+            )
+            try:
+                self._capture_stream = self._pa.open(
+                    format=pyaudio.paInt16,
+                    channels=1,
+                    rate=48000,
+                    input=True,
+                    input_device_index=input_dev,
+                    frames_per_buffer=1024,
+                )
+                self._capture_native_rate = 48000
+                log.info(
+                    "[Audio] Capture at 48000Hz — will resample to "
+                    f"{capture_rate}Hz for STT"
+                )
+            except Exception as e2:
+                log.error(f"[Audio] Capture stream failed: {e2}")
+                self._capture_stream = None
 
         status = []
         if self._playback_stream:
@@ -1204,17 +1225,21 @@ class AGiXTVoiceClient:
                 return
 
         sample_rate = self.audio_config.get("sample_rate", 16000)
+        native_rate = self.robot._capture_native_rate
+        needs_resample = native_rate != sample_rate
         chunk_duration = self.audio_config.get("chunk_duration", 0.5)
         silence_threshold = self.audio_config.get("silence_threshold", 500)
         silence_duration = self.audio_config.get("silence_duration", 1.5)
         max_speech = self.audio_config.get("max_speech_duration", 30.0)
 
-        chunk_frames = int(sample_rate * chunk_duration)
+        # Read at native rate, resample later if needed
+        chunk_frames = int(native_rate * chunk_duration)
         loop = asyncio.get_event_loop()
         max_buffer_bytes = 5 * 1024 * 1024  # 5MB hard limit on speech buffer
 
+        rate_info = f"{native_rate}Hz→{sample_rate}Hz" if needs_resample else f"{sample_rate}Hz"
         log.info(
-            f"[Audio] Capture started (rate={sample_rate}Hz, "
+            f"[Audio] Capture started (rate={rate_info}, "
             f"vad_threshold={silence_threshold}, "
             f"silence={silence_duration}s)"
         )
@@ -1265,6 +1290,13 @@ class AGiXTVoiceClient:
                     time.time() - self._audio_stop_time < self._echo_tail_s
                 ):
                     continue
+
+                # Resample from native rate to target rate if needed
+                if needs_resample:
+                    samples_native = np.frombuffer(pcm_data, dtype=np.int16)
+                    num_target = int(len(samples_native) * sample_rate / native_rate)
+                    indices = np.linspace(0, len(samples_native) - 1, num_target).astype(int)
+                    pcm_data = samples_native[indices].astype(np.int16).tobytes()
 
                 # Compute RMS energy for VAD
                 samples = np.frombuffer(pcm_data, dtype=np.int16)
