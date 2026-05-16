@@ -21,13 +21,17 @@ import sys
 import json
 import time
 import wave
+import hmac
+import hashlib
 import base64
 import struct
 import asyncio
 import logging
 import argparse
+import copy
 from typing import Optional
 from pathlib import Path
+from datetime import datetime, timezone
 
 import yaml
 import numpy as np
@@ -85,6 +89,21 @@ DEFAULT_CONFIG = {
         "input_device": None,  # None = system default, or device index
         "output_device": None,  # None = system default, or device index
     },
+    "identity_evidence": {
+        "enabled": True,
+        "company_id": "",
+        "machine_id": "",
+        "key_id": "",
+        "signing_secret": "",
+        "algorithm": "hmac_sha256",
+        "camera_stream_id": "go2-camera",
+        "audio_stream_id": "go2-audio",
+        "camera_enabled": True,
+        "audio_enabled": True,
+        "jpeg_quality": 75,
+        "max_face_evidence_bytes": 256 * 1024,
+        "max_voice_evidence_bytes": 512 * 1024,
+    },
     "wake_word": {
         "enabled": True,
         "word": "hey robot",  # wake word phrase
@@ -117,7 +136,7 @@ DEFAULT_CONFIG = {
 
 
 def load_config(path: Optional[str] = None) -> dict:
-    config = DEFAULT_CONFIG.copy()
+    config = copy.deepcopy(DEFAULT_CONFIG)
     if path and Path(path).exists():
         with open(path) as f:
             user_config = yaml.safe_load(f)
@@ -138,6 +157,26 @@ def load_config(path: Optional[str] = None) -> dict:
             "1",
             "yes",
         )
+    identity_cfg = config.setdefault("identity_evidence", {})
+    env_identity = {
+        "AGIXT_COMPANY_ID": "company_id",
+        "XTS_COMPANY_ID": "company_id",
+        "AGIXT_MACHINE_ID": "machine_id",
+        "XTS_MACHINE_ID": "machine_id",
+        "AGIXT_EVIDENCE_KEY_ID": "key_id",
+        "XTS_EVIDENCE_KEY_ID": "key_id",
+        "AGIXT_EVIDENCE_SIGNING_SECRET": "signing_secret",
+        "XTS_EVIDENCE_SIGNING_SECRET": "signing_secret",
+    }
+    for env_key, config_key in env_identity.items():
+        if os.environ.get(env_key):
+            identity_cfg[config_key] = os.environ[env_key]
+    if os.environ.get("AGIXT_IDENTITY_EVIDENCE"):
+        identity_cfg["enabled"] = os.environ["AGIXT_IDENTITY_EVIDENCE"].lower() in (
+            "true",
+            "1",
+            "yes",
+        )
     # Auto-detect voice server for wake word
     if not config["wake_word"].get("server"):
         voice_server = os.environ.get("VOICE_SERVER", "")
@@ -152,6 +191,140 @@ def _deep_merge(base: dict, override: dict):
             _deep_merge(base[k], v)
         else:
             base[k] = v
+
+
+def _utc_now_rfc3339() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _sha256_hex(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _compact_metadata(value):
+    if isinstance(value, dict):
+        return {
+            key: _compact_metadata(inner)
+            for key, inner in value.items()
+            if inner is not None and inner != ""
+        }
+    if isinstance(value, list):
+        return [_compact_metadata(item) for item in value if item is not None]
+    return value
+
+
+def _read_linux_temperature_c() -> Optional[float]:
+    thermal_root = Path("/sys/class/thermal")
+    if not thermal_root.exists():
+        return None
+    for zone in thermal_root.glob("thermal_zone*/temp"):
+        try:
+            raw = zone.read_text().strip()
+            if not raw:
+                continue
+            value = float(raw)
+            if value > 1000:
+                value /= 1000.0
+            if -40.0 <= value <= 125.0:
+                return round(value, 1)
+        except Exception:
+            continue
+    return None
+
+
+def _read_linux_memory_pressure() -> dict:
+    meminfo = Path("/proc/meminfo")
+    if not meminfo.exists():
+        return {}
+    values = {}
+    try:
+        for line in meminfo.read_text().splitlines():
+            parts = line.split()
+            if len(parts) >= 2:
+                values[parts[0].rstrip(":")] = int(parts[1])
+    except Exception:
+        return {}
+    total = values.get("MemTotal")
+    available = values.get("MemAvailable")
+    if not total or available is None:
+        return {}
+    used_ratio = max(0.0, min(1.0, 1.0 - (available / total)))
+    return {
+        "memory_total_kib": total,
+        "memory_available_kib": available,
+        "memory_used_ratio": round(used_ratio, 3),
+    }
+
+
+def _host_resource_pressure() -> dict:
+    cpu_count = max(os.cpu_count() or 1, 1)
+    pressure = {
+        "cpu_count": cpu_count,
+        "temperature_c": _read_linux_temperature_c(),
+    }
+    try:
+        load_1m, load_5m, load_15m = os.getloadavg()
+        pressure.update(
+            {
+                "load_1m": round(load_1m, 3),
+                "load_5m": round(load_5m, 3),
+                "load_15m": round(load_15m, 3),
+                "load_1m_ratio": round(load_1m / cpu_count, 3),
+            }
+        )
+    except (AttributeError, OSError):
+        pass
+    pressure.update(_read_linux_memory_pressure())
+    return _compact_metadata(pressure)
+
+
+def _evidence_envelope_binding(
+    company_id: str, request: dict, payload_sha256: str
+) -> str:
+    fields = [
+        company_id or "",
+        request.get("machine_id") or "",
+        request.get("key_id") or "",
+        request.get("conversation_id") or "",
+        request.get("stream_id") or "",
+        str(request.get("sequence_number") or 0),
+        request.get("captured_at") or "",
+        request.get("sent_at") or "",
+        payload_sha256 or "",
+        request.get("previous_payload_sha256") or "",
+        request.get("transport_format") or "",
+        request.get("content_type") or "",
+        request.get("codec") or "",
+        str(request.get("width") or ""),
+        str(request.get("height") or ""),
+        str(request.get("sample_rate_hz") or ""),
+        str(request.get("channels") or ""),
+        str(request.get("duration_ms") or ""),
+        request.get("evidence_profile") or "",
+        str(request.get("dropped_media_count") or ""),
+        request.get("drop_reason") or "",
+        request.get("challenge_id")
+        or request.get("metadata", {}).get("challenge_id")
+        or "",
+        request.get("nonce") or request.get("metadata", {}).get("nonce") or "",
+        request.get("command_id")
+        or request.get("metadata", {}).get("command_id")
+        or "",
+        request.get("action_type")
+        or request.get("metadata", {}).get("action_type")
+        or "",
+        request.get("command_name")
+        or request.get("metadata", {}).get("command_name")
+        or "",
+    ]
+    return "v3|" + "|".join(fields)
+
+
+def sign_evidence_hmac(
+    company_id: str, request: dict, payload_sha256: str, secret: str
+) -> str:
+    binding = _evidence_envelope_binding(company_id, request, payload_sha256)
+    return hmac.new(secret.encode(), binding.encode(), hashlib.sha256).hexdigest()
 
 
 # ─── Sport Action Map ───────────────────────────────────────────────────
@@ -407,6 +580,7 @@ class Go2Robot:
         self._current_posture = "standing"  # standing, sitting, moving, unknown
         self._last_action = ""
         self._sim_battery = 85  # simulation battery level
+        self._latest_state_snapshot: dict = {}
 
     async def connect(self):
         """Connect to the robot via configured method."""
@@ -604,6 +778,13 @@ class Go2Robot:
         """Get the robot's current body state as a human-readable summary."""
         if self.simulation:
             self._sim_battery = max(5, self._sim_battery - 0.1)
+            self._latest_state_snapshot = {
+                "posture": self._current_posture,
+                "battery_percent": round(self._sim_battery, 1),
+                "mode": "simulation",
+                "last_action": self._last_action or "none",
+                "moving": self._is_moving,
+            }
             return (
                 f"Posture: {self._current_posture} | "
                 f"Battery: {self._sim_battery:.0f}% | "
@@ -634,6 +815,18 @@ class Go2Robot:
             vy = velocity.get("vy", 0)
 
             self._current_posture = posture
+            self._latest_state_snapshot = {
+                "posture": posture,
+                "battery_percent": battery,
+                "roll": roll,
+                "pitch": pitch,
+                "yaw": yaw,
+                "velocity_x": vx,
+                "velocity_y": vy,
+                "mode": state.get("mode", -1),
+                "last_action": self._last_action or "none",
+                "moving": self._is_moving,
+            }
             return (
                 f"Posture: {posture} | "
                 f"Battery: {battery}% | "
@@ -643,6 +836,39 @@ class Go2Robot:
             )
         except Exception as e:
             return f"Error reading state: {e}"
+
+    def identity_evidence_metadata(self) -> dict:
+        """Best-effort robot integrity and operating-state context.
+
+        WorkConductor remains the trust authority; these fields let the server
+        cap or downgrade assurance when the robot reports weak integrity,
+        unknown firmware, resource pressure, or poor capture conditions.
+        """
+        integrity_cfg = self.config.get("identity_evidence", {})
+        capture_devices = integrity_cfg.get("capture_devices", {})
+        metadata = {
+            "robot_connection": self.robot_config.get("connection", "dds"),
+            "robot_serial_number": self.robot_config.get("serial_number"),
+            "robot_connected": self._connected,
+            "robot_simulation": self.simulation,
+            "robot_state": self._latest_state_snapshot,
+            "device_integrity": {
+                "app": "go2control",
+                "app_version": integrity_cfg.get("app_version", "unknown"),
+                "firmware_version": integrity_cfg.get("firmware_version", "unknown"),
+                "secure_boot_state": integrity_cfg.get("secure_boot_state", "unknown"),
+                "tamper_state": integrity_cfg.get("tamper_state", "unknown"),
+                "sensor_attestation": integrity_cfg.get(
+                    "sensor_attestation", "unavailable"
+                ),
+                "capture_device_integrity": integrity_cfg.get(
+                    "capture_device_integrity", "unknown"
+                ),
+                "camera_device_id": capture_devices.get("camera"),
+                "microphone_device_id": capture_devices.get("microphone"),
+            },
+        }
+        return _compact_metadata(metadata)
 
     def cleanup_audio(self):
         """Clean up PyAudio resources."""
@@ -869,6 +1095,7 @@ class AGiXTVoiceClient:
         self.agixt_config = config["agixt"]
         self.camera_config = config["camera"]
         self.audio_config = config["audio"]
+        self.identity_config = config.get("identity_evidence", {})
         self.wake_word_config = config.get("wake_word", {})
         self.idle_config = config.get("idle", {})
 
@@ -896,6 +1123,13 @@ class AGiXTVoiceClient:
 
         # WebSocket send lock to prevent message interleaving
         self._ws_send_lock = asyncio.Lock()
+
+        # Server-authoritative identity evidence transport state
+        self._evidence_sequence: dict[str, int] = {}
+        self._evidence_previous_hash: dict[str, str] = {}
+        self._evidence_profile = "normal"
+        self._identity_evidence_sent_bytes = 0
+        self._identity_evidence_dropped_media = 0
 
         # Idle behavior state
         self._last_idle_look = 0.0
@@ -1009,6 +1243,38 @@ class AGiXTVoiceClient:
                         req_data = data.get("data", {})
                         asyncio.ensure_future(self._handle_tool_request(req_data))
 
+                    elif msg_type == "identity.updated":
+                        decision = data.get("data", {}).get("decision", {})
+                        log.info(
+                            "[Identity] decision=%s assurance=%s explanation=%s",
+                            decision.get("action", "unknown"),
+                            decision.get("assurance_level", "none"),
+                            decision.get("explanation_code", ""),
+                        )
+
+                    elif msg_type == "identity.evidence_steering":
+                        steering = data.get("data", {})
+                        profile = steering.get("evidence_profile")
+                        if profile:
+                            self._evidence_profile = profile
+                            log.info(
+                                "[Identity] evidence profile set to %s (%s)",
+                                profile,
+                                steering.get("reason", "identity_policy"),
+                            )
+                            async with self._ws_send_lock:
+                                await self._ws.send(
+                                    json.dumps(
+                                        {
+                                            "type": "identity.evidence_steering_ack",
+                                            "data": {
+                                                "evidence_profile": profile,
+                                                "source": "go2_client",
+                                            },
+                                        }
+                                    )
+                                )
+
                     elif msg_type == "session.end":
                         reason = data.get("data", {}).get("reason", "")
                         log.info(f"[AGiXT] Session ended: {reason}")
@@ -1081,6 +1347,147 @@ class AGiXTVoiceClient:
                 except Exception as e2:
                     log.error(f"[AGiXT] Reconnection failed: {e2}")
                     continue
+
+    def _identity_evidence_ready(self) -> bool:
+        cfg = self.identity_config
+        if not cfg.get("enabled", True):
+            return False
+        required = ("company_id", "machine_id", "key_id", "signing_secret")
+        missing = [key for key in required if not cfg.get(key)]
+        if missing:
+            log.debug("[Identity] evidence disabled; missing %s", ", ".join(missing))
+            return False
+        if cfg.get("algorithm", "hmac_sha256") != "hmac_sha256":
+            log.warning(
+                "[Identity] unsupported evidence algorithm: %s", cfg.get("algorithm")
+            )
+            return False
+        return True
+
+    def _next_evidence_sequence(self, stream_id: str) -> int:
+        current = self._evidence_sequence.get(stream_id, 0) + 1
+        self._evidence_sequence[stream_id] = current
+        return current
+
+    def _identity_common_metadata(self, metadata: Optional[dict] = None) -> dict:
+        common = {
+            "capture_client": "go2control",
+            "evidence_profile": self._evidence_profile,
+            "resource_pressure": _host_resource_pressure(),
+            "transport_pressure": {
+                "sent_bytes_session": self._identity_evidence_sent_bytes,
+                "dropped_media_session": self._identity_evidence_dropped_media,
+            },
+        }
+        robot_metadata = getattr(self.robot, "identity_evidence_metadata", None)
+        if callable(robot_metadata):
+            common.update(robot_metadata())
+        else:
+            common["robot_connection"] = getattr(self.robot, "robot_config", {}).get(
+                "connection", "unknown"
+            )
+        common.update(metadata or {})
+        return _compact_metadata(common)
+
+    def _build_identity_evidence(
+        self,
+        *,
+        method_type: str,
+        stream_id: str,
+        transport_format: str,
+        payload: bytes,
+        content_type: str,
+        codec: str,
+        captured_at: Optional[str] = None,
+        width: Optional[int] = None,
+        height: Optional[int] = None,
+        sample_rate_hz: Optional[int] = None,
+        channels: Optional[int] = None,
+        duration_ms: Optional[int] = None,
+        dropped_media_count: Optional[int] = None,
+        drop_reason: Optional[str] = None,
+        metadata: Optional[dict] = None,
+    ) -> dict:
+        cfg = self.identity_config
+        payload_sha256 = _sha256_hex(payload)
+        previous_hash = self._evidence_previous_hash.get(stream_id, "")
+        request = {
+            "company_id": cfg.get("company_id"),
+            "machine_id": cfg.get("machine_id"),
+            "conversation_id": self.agixt_config.get("conversation_id", "-"),
+            "stream_id": stream_id,
+            "sequence_number": self._next_evidence_sequence(stream_id),
+            "captured_at": captured_at or _utc_now_rfc3339(),
+            "sent_at": _utc_now_rfc3339(),
+            "content_type": content_type,
+            "codec": codec,
+            "payload_sha256": payload_sha256,
+            "previous_payload_sha256": previous_hash or None,
+            "key_id": cfg.get("key_id"),
+            "transport_format": transport_format,
+            "evidence_profile": self._evidence_profile,
+            "method_type": method_type,
+            "data_base64": base64.b64encode(payload).decode(),
+            "device_class": (
+                "go2_robot_camera" if method_type == "face" else "go2_robot_microphone"
+            ),
+            "risk_level": "medium",
+            "metadata": self._identity_common_metadata(metadata),
+        }
+        optional_values = {
+            "width": width,
+            "height": height,
+            "sample_rate_hz": sample_rate_hz,
+            "channels": channels,
+            "duration_ms": duration_ms,
+            "dropped_media_count": dropped_media_count,
+            "drop_reason": drop_reason,
+        }
+        for key, value in optional_values.items():
+            if value is not None:
+                request[key] = value
+        request["signature"] = sign_evidence_hmac(
+            cfg.get("company_id", ""),
+            request,
+            payload_sha256,
+            cfg.get("signing_secret", ""),
+        )
+        self._evidence_previous_hash[stream_id] = payload_sha256
+        return request
+
+    async def _send_identity_evidence(self, request: dict):
+        if not self._ws or not self._running:
+            return
+        message = json.dumps({"type": "identity.evidence", "data": request})
+        async with self._ws_send_lock:
+            await self._ws.send(message)
+        self._identity_evidence_sent_bytes += len(message.encode())
+        log.debug(
+            "[Identity] sent %s seq=%s profile=%s",
+            request.get("method_type"),
+            request.get("sequence_number"),
+            request.get("evidence_profile"),
+        )
+
+    async def _send_dropped_identity_marker(
+        self, stream_id: str, method_type: str, reason: str
+    ):
+        if not self._identity_evidence_ready():
+            return
+        self._identity_evidence_dropped_media += 1
+        marker = json.dumps({"dropped": 1, "reason": reason}).encode()
+        request = self._build_identity_evidence(
+            method_type=method_type,
+            stream_id=stream_id,
+            transport_format="dropped_media_marker",
+            payload=marker,
+            content_type="application/json",
+            codec="metadata",
+            dropped_media_count=1,
+            drop_reason=reason,
+            metadata={"source": "go2_client"},
+        )
+        await self._send_identity_evidence(request)
 
     async def _handle_tool_request(self, req_data: dict):
         """Execute a tool request from AGiXT on the robot."""
@@ -1200,6 +1607,54 @@ class AGiXTVoiceClient:
                     await self._ws.send(
                         json.dumps({"type": "image.input", "data": b64})
                     )
+                    if self._identity_evidence_ready() and self.identity_config.get(
+                        "camera_enabled", True
+                    ):
+                        camera_stream_id = self.identity_config.get(
+                            "camera_stream_id", "go2-camera"
+                        )
+                        if self._evidence_profile in ("face_suspended", "voice_only"):
+                            await self._send_dropped_identity_marker(
+                                camera_stream_id, "face", "server_steering"
+                            )
+                        else:
+                            max_bytes = int(
+                                self.identity_config.get(
+                                    "max_face_evidence_bytes", 256 * 1024
+                                )
+                            )
+                            if len(jpeg_bytes) > max_bytes:
+                                await self._send_dropped_identity_marker(
+                                    camera_stream_id, "face", "client_backpressure"
+                                )
+                            else:
+                                width = height = None
+                                try:
+                                    frame = cv2.imdecode(
+                                        np.frombuffer(jpeg_bytes, dtype=np.uint8),
+                                        cv2.IMREAD_COLOR,
+                                    )
+                                    if frame is not None:
+                                        height, width = frame.shape[:2]
+                                except Exception:
+                                    pass
+                                evidence = self._build_identity_evidence(
+                                    method_type="face",
+                                    stream_id=camera_stream_id,
+                                    transport_format="jpeg_frame",
+                                    payload=jpeg_bytes,
+                                    content_type="image/jpeg",
+                                    codec="jpeg",
+                                    width=width,
+                                    height=height,
+                                    metadata={
+                                        "source": "go2_client_camera_loop",
+                                        "robot_connection": self.robot.robot_config.get(
+                                            "connection", "dds"
+                                        ),
+                                    },
+                                )
+                                await self._send_identity_evidence(evidence)
                     log.debug(
                         f"[Camera] Sent frame ({len(jpeg_bytes)} bytes, "
                         f"{len(b64)} b64)"
@@ -1506,6 +1961,35 @@ class AGiXTVoiceClient:
             await self._ws.send(wav_data)
             await self._ws.send(json.dumps({"type": "audio.input.end"}))
         log.info(f"[Audio] Sent {len(wav_data)} bytes WAV to AGiXT")
+        if self._identity_evidence_ready() and self.identity_config.get(
+            "audio_enabled", True
+        ):
+            stream_id = self.identity_config.get("audio_stream_id", "go2-audio")
+            max_bytes = int(
+                self.identity_config.get("max_voice_evidence_bytes", 512 * 1024)
+            )
+            if len(wav_data) > max_bytes:
+                await self._send_dropped_identity_marker(
+                    stream_id, "voice", "client_backpressure"
+                )
+            else:
+                duration_ms = int((len(pcm_data) / max(sample_rate * 2, 1)) * 1000)
+                evidence = self._build_identity_evidence(
+                    method_type="voice",
+                    stream_id=stream_id,
+                    transport_format="pcm_audio",
+                    payload=wav_data,
+                    content_type="audio/wav",
+                    codec="wav",
+                    sample_rate_hz=sample_rate,
+                    channels=1,
+                    duration_ms=duration_ms,
+                    metadata={
+                        "source": "go2_client_audio_loop",
+                        "wake_word_active": self._wake_word_active,
+                    },
+                )
+                await self._send_identity_evidence(evidence)
 
     async def send_text(self, text: str):
         """Send a text message to AGiXT (for testing without audio)."""

@@ -200,6 +200,7 @@ class RobotConnection:
         self._mic_buffer: list[bytes] = []
         self._video_task: Optional[asyncio.Task] = None
         self._audio_task: Optional[asyncio.Task] = None
+        self._battery_percent: Optional[int] = 85 if config.simulation else None
 
     @property
     def connected(self) -> bool:
@@ -331,7 +332,9 @@ class RobotConnection:
                     import cv2
 
                     _, buf = cv2.imencode(
-                        ".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, self.config.video.jpeg_quality]
+                        ".jpg",
+                        img,
+                        [cv2.IMWRITE_JPEG_QUALITY, self.config.video.jpeg_quality],
                     )
                     self._last_frame = buf.tobytes()
                 except ImportError:
@@ -436,6 +439,31 @@ class RobotConnection:
             except Exception:
                 pass
         return self._volume
+
+    def get_battery_percent(self) -> int:
+        """Return the latest robot battery percentage when the SDK exposes it."""
+        if self.config.simulation:
+            return int(self._battery_percent or 85)
+
+        if self._sport_client:
+            try:
+                code, state = self._sport_client.GetState()
+                if code == 0:
+                    value = None
+                    if isinstance(state, dict):
+                        value = state.get("battery_level") or state.get(
+                            "battery_percent"
+                        )
+                    else:
+                        value = getattr(state, "battery_level", None) or getattr(
+                            state, "battery_percent", None
+                        )
+                    if value is not None:
+                        self._battery_percent = max(0, min(100, int(round(value))))
+            except Exception as e:
+                logger.debug("Battery state read failed: %s", e)
+
+        return int(self._battery_percent or 0)
 
     # -- Sport commands --
 
@@ -795,7 +823,12 @@ class RobotController:
             # Update mode based on action
             if action_name == "damp":
                 self.current_mode = RobotMode.DAMPING
-            elif action_name in ("stand_up", "balance_stand", "recovery_stand", "rise_sit"):
+            elif action_name in (
+                "stand_up",
+                "balance_stand",
+                "recovery_stand",
+                "rise_sit",
+            ):
                 self.current_mode = RobotMode.STANDING
             elif action_name in ("stand_down",):
                 self.current_mode = RobotMode.LYING_DOWN
@@ -816,7 +849,7 @@ class RobotController:
         return RobotStatus(
             mode=self.current_mode.value,
             speed_level=self.speed_level,
-            battery_percent=100,  # TODO: read from robot
+            battery_percent=self.robot.get_battery_percent(),
             connected=self.robot.connected,
             api_control_active=self._api_active,
             current_velocity={
@@ -964,9 +997,7 @@ async def emergency_stop():
 @app.get("/api/v1/actions", tags=["Actions"])
 async def list_actions():
     return {
-        "actions": {
-            name: info["desc"] for name, info in SPORT_ACTIONS.items()
-        },
+        "actions": {name: info["desc"] for name, info in SPORT_ACTIONS.items()},
         "total": len(SPORT_ACTIONS),
     }
 
@@ -1118,23 +1149,38 @@ async def get_agent_context():
             "is_moving": status.api_control_active,
             "volume": status.volume,
         },
-        "actions": {
-            name: info["desc"] for name, info in SPORT_ACTIONS.items()
-        },
+        "actions": {name: info["desc"] for name, info in SPORT_ACTIONS.items()},
         "action_categories": {
             "state_transitions": [
-                "damp", "balance_stand", "stop_move", "stand_up",
-                "stand_down", "recovery_stand", "sit", "rise_sit",
+                "damp",
+                "balance_stand",
+                "stop_move",
+                "stand_up",
+                "stand_down",
+                "recovery_stand",
+                "sit",
+                "rise_sit",
             ],
             "tricks": [
-                "hello", "stretch", "content", "dance1", "dance2",
-                "pose", "scrape", "front_flip", "front_jump",
-                "front_pounce", "heart",
+                "hello",
+                "stretch",
+                "content",
+                "dance1",
+                "dance2",
+                "pose",
+                "scrape",
+                "front_flip",
+                "front_jump",
+                "front_pounce",
+                "heart",
             ],
             "flips": ["front_flip", "left_flip", "back_flip"],
             "gaits": ["static_walk", "trot_run", "economic_gait"],
             "modes": [
-                "free_walk", "cross_step", "hand_stand", "switch_joystick",
+                "free_walk",
+                "cross_step",
+                "hand_stand",
+                "switch_joystick",
             ],
         },
         "movement": {
@@ -1197,7 +1243,11 @@ async def agent_command(body: dict):
                 duration=float(params.get("duration", 2.0)),
             )
             await robot_controller.set_move_command(cmd)
-            return {"success": True, "message": f"Moving: vx={cmd.vx} vy={cmd.vy} vyaw={cmd.vyaw}", "action": "move"}
+            return {
+                "success": True,
+                "message": f"Moving: vx={cmd.vx} vy={cmd.vy} vyaw={cmd.vyaw}",
+                "action": "move",
+            }
 
         elif command == "stop":
             await robot_controller.stop_movement()
@@ -1207,19 +1257,35 @@ async def agent_command(body: dict):
             name = params.get("name", "")
             ok = await robot_controller.execute_action(name)
             if ok:
-                return {"success": True, "message": f"Executing: {name}", "action": "action"}
+                return {
+                    "success": True,
+                    "message": f"Executing: {name}",
+                    "action": "action",
+                }
             available = list(SPORT_ACTIONS.keys())
-            return {"success": False, "message": f"Unknown action '{name}'. Available: {available}", "action": "action"}
+            return {
+                "success": False,
+                "message": f"Unknown action '{name}'. Available: {available}",
+                "action": "action",
+            }
 
         elif command == "sequence":
             name = params.get("name", "")
             data = robot_controller.sequence_library.get(name)
             if not data:
                 available = list(robot_controller.sequence_library.list().keys())
-                return {"success": False, "message": f"Sequence '{name}' not found. Available: {available}", "action": "sequence"}
+                return {
+                    "success": False,
+                    "message": f"Sequence '{name}' not found. Available: {available}",
+                    "action": "sequence",
+                }
             seq = SequenceCommand(**data)
             seq_id = await robot_controller.sequence_runner.start(seq)
-            return {"success": True, "message": f"Sequence '{name}' started (id={seq_id})", "action": "sequence"}
+            return {
+                "success": True,
+                "message": f"Sequence '{name}' started (id={seq_id})",
+                "action": "sequence",
+            }
 
         elif command == "euler":
             await robot_controller.robot.set_euler(
@@ -1233,7 +1299,11 @@ async def agent_command(body: dict):
             level = int(params.get("level", 0))
             await robot_controller.robot.set_speed_level(level)
             robot_controller.speed_level = level
-            return {"success": True, "message": f"Speed level: {level}", "action": "speed_level"}
+            return {
+                "success": True,
+                "message": f"Speed level: {level}",
+                "action": "speed_level",
+            }
 
         elif command == "volume":
             level = int(params.get("level", 5))
@@ -1243,15 +1313,27 @@ async def agent_command(body: dict):
         elif command == "camera":
             frame = robot_controller.robot.get_camera_image()
             if frame is None:
-                return {"success": False, "message": "No camera frame available", "action": "camera"}
+                return {
+                    "success": False,
+                    "message": "No camera frame available",
+                    "action": "camera",
+                }
             b64 = base64.b64encode(frame).decode("utf-8")
-            return {"success": True, "image": f"data:image/jpeg;base64,{b64}", "action": "camera"}
+            return {
+                "success": True,
+                "image": f"data:image/jpeg;base64,{b64}",
+                "action": "camera",
+            }
 
         elif command == "mic":
             seconds = float(params.get("seconds", 5.0))
             audio = robot_controller.robot.get_mic_audio(seconds)
             if audio is None:
-                return {"success": False, "message": "No mic audio available", "action": "mic"}
+                return {
+                    "success": False,
+                    "message": "No mic audio available",
+                    "action": "mic",
+                }
             b64 = base64.b64encode(audio).decode("utf-8")
             return {
                 "success": True,
@@ -1296,7 +1378,9 @@ async def ws_telemetry(ws: WebSocket):
                 elif cmd_type == "stop":
                     await robot_controller.stop_movement()
                 elif cmd_type == "action":
-                    await robot_controller.execute_action(msg.get("data", {}).get("name", ""))
+                    await robot_controller.execute_action(
+                        msg.get("data", {}).get("name", "")
+                    )
                 elif cmd_type == "emergency_stop":
                     await robot_controller.emergency_stop()
             except Exception as e:
@@ -1336,7 +1420,9 @@ if __name__ == "__main__":
     config = load_config()
     print(f"\n  Unitree Go2 Pro Robot API Server v0.1.0")
     print(f"  Host: {config.host}:{config.port}")
-    print(f"  Connection: {config.connection.method} ({config.connection.connection_mode})")
+    print(
+        f"  Connection: {config.connection.method} ({config.connection.connection_mode})"
+    )
     print(f"  Robot IP: {config.connection.robot_ip}")
     print(f"  Simulation: {config.simulation}")
     print(f"  Actions: {len(SPORT_ACTIONS)} sport actions available")

@@ -90,12 +90,8 @@ def load_config() -> AppConfig:
             connection_mode=_env_or(
                 raw.get("connection", {}), "connection_mode", "LocalAP", str
             ),
-            serial_number=_env_or(
-                raw.get("connection", {}), "serial_number", "", str
-            ),
-            dds_domain_id=_env_or(
-                raw.get("connection", {}), "dds_domain_id", 0, int
-            ),
+            serial_number=_env_or(raw.get("connection", {}), "serial_number", "", str),
+            dds_domain_id=_env_or(raw.get("connection", {}), "dds_domain_id", 0, int),
             dds_interface=_env_or(
                 raw.get("connection", {}), "dds_interface", "eth0", str
             ),
@@ -113,9 +109,7 @@ def load_config() -> AppConfig:
             ramp_rate=_env_or(raw.get("safety", {}), "ramp_rate", 3.0, float),
         ),
         audio=AudioConfig(
-            default_volume=_env_or(
-                raw.get("audio", {}), "default_volume", 5, int
-            ),
+            default_volume=_env_or(raw.get("audio", {}), "default_volume", 5, int),
             enable_mic=_env_or(raw.get("audio", {}), "enable_mic", True, bool),
             sample_rate=_env_or(raw.get("audio", {}), "sample_rate", 48000, int),
             channels=_env_or(raw.get("audio", {}), "channels", 2, int),

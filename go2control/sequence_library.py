@@ -96,7 +96,11 @@ BUILTIN_SEQUENCES: dict[str, dict] = {
             {"action": "euler", "params": {"yaw": -0.5}, "duration": 2.0},
             {"action": "euler", "params": {"pitch": 0.3}, "duration": 1.5},
             {"action": "euler", "params": {"pitch": -0.3}, "duration": 1.5},
-            {"action": "euler", "params": {"roll": 0.0, "pitch": 0.0, "yaw": 0.0}, "duration": 1.0},
+            {
+                "action": "euler",
+                "params": {"roll": 0.0, "pitch": 0.0, "yaw": 0.0},
+                "duration": 1.0,
+            },
         ],
         "loop": False,
     },

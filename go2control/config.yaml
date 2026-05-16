@@ -39,6 +39,22 @@ audio:
   # Max seconds of continuous speech
   max_speech_duration: 30.0
 
+identity_evidence:
+  # Sends server-authoritative signed face/voice evidence over the AGiXT voice WebSocket.
+  # WorkConductor still performs all biometric matching and identity decisions.
+  enabled: true
+  company_id: ""
+  machine_id: ""
+  key_id: ""
+  signing_secret: ""
+  algorithm: "hmac_sha256"
+  camera_stream_id: "go2-camera"
+  audio_stream_id: "go2-audio"
+  camera_enabled: true
+  audio_enabled: true
+  max_face_evidence_bytes: 262144
+  max_voice_evidence_bytes: 524288
+
 safety:
   # Maximum velocities (conservative for voice control)
   max_vx: 1.0      # m/s forward/backward

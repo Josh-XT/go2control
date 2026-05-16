@@ -19,6 +19,7 @@ REST + WebSocket API for controlling the Unitree Go2 Pro robot dog, with AGiXT A
 - **Wake Word**: Configurable wake word detection (e.g., "hey robot")
 - **Idle Personality**: Autonomous look-around, animations, and contextual comments when idle
 - **Vision**: Periodic camera frames sent to AGiXT for visual understanding
+- **Signed Identity Evidence**: HMAC-bound face/voice envelopes with monotonic sequence numbers for WorkConductor server-side identity decisions
 
 ## Quick Start
 
@@ -214,7 +215,19 @@ idle:
 audio:
   capture_rate: 16000
   playback_rate: 24000
+
+identity_evidence:
+  enabled: true
+  company_id: "<company-id>"
+  machine_id: "<machine-id>"
+  key_id: "<workconductor-evidence-key-id>"
+  signing_secret: "<hmac-secret-provisioned-by-workconductor>"
+  algorithm: "hmac_sha256"
+  max_face_evidence_bytes: 262144
+  max_voice_evidence_bytes: 524288
 ```
+
+The identity evidence keys can also be provided with `XTS_COMPANY_ID`, `XTS_MACHINE_ID`, `XTS_EVIDENCE_KEY_ID`, and `XTS_EVIDENCE_SIGNING_SECRET`. The robot never submits trusted biometric scores; it sends signed media envelopes and follows WorkConductor's `identity.updated` and `identity.evidence_steering` messages.
 
 #### 5. Install systemd service
 

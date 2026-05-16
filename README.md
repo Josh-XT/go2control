@@ -15,6 +15,7 @@ Voice-controlled robot dog using AGiXT's real-time voice conversation pipeline. 
 **Data flows:**
 - **Camera → AGiXT:** Periodic JPEG frames from Go2 camera sent as vision context
 - **Microphone → AGiXT:** Audio from Go2 mic (or Pi USB mic) sent for STT
+- **Identity evidence → WorkConductor:** Signed, sequence-protected face/voice evidence envelopes for server-side matching and policy decisions
 - **AGiXT → Robot:** Tool calls for movement, actions, body orientation
 - **AGiXT → Speaker:** TTS audio streamed back for robot to speak
 
@@ -35,7 +36,13 @@ export AGIXT_SERVER="ws://your-agixt-server:7437"
 export AGIXT_JWT="your-jwt-token"
 export GO2_IP="192.168.123.161"
 export GO2_CONNECTION="dds"
+export XTS_COMPANY_ID="your-company-id"
+export XTS_MACHINE_ID="your-machine-id"
+export XTS_EVIDENCE_KEY_ID="provisioned-key-id"
+export XTS_EVIDENCE_SIGNING_SECRET="provisioned-hmac-secret"
 ```
+
+Identity evidence stays server-authoritative: the robot signs bounded media envelopes and WorkConductor performs matching, liveness policy, replay checks, and allow/deny/challenge decisions. Set `AGIXT_IDENTITY_EVIDENCE=false` only for local development without a provisioned evidence signing key.
 
 ### 3. Run
 
